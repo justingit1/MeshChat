@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>MeshChat</AssemblyName>
+    <RootNamespace>MeshChat</RootNamespace>
+
+    <!-- School Laptop Optimization: Self-Contained Portable Executable -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+
+    <!-- ReadyToRun: Pre-compile to native code for faster startup -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <PublishReadyToRunEmitSymbolFile>false</PublishReadyToRunEmitSymbolFile>
+
+    <!-- Performance optimizations for low-end/school computers -->
+    <!-- Keep tiered compilation ON for faster JIT (helps startup) -->
+    <TieredCompilation>true</TieredCompilation>
+    <!-- Server GC is better for throughput, doesn't hurt startup -->
+    <gcServer>true</gcServer>
+    <!-- Keep concurrent GC enabled to avoid blocking during collections -->
+    <gcConcurrent>true</gcConcurrent>
+
+    <!-- Trim unused code to reduce file size -->
+    <PublishTrimmed>false</PublishTrimmed>
+
+    <!-- Disable debug info for smaller/faster release build -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
+    <!-- Optimized for speed over size -->
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
+    <PackageReference Include="InTheHand.Net.Bluetooth" Version="4.1.40" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
+  </ItemGroup>
+</Project>

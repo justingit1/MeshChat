@@ -1,0 +1,44 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+    <!-- App Title -->
+    <sys:String x:Key="AppTitle">MeshChat</sys:String>
+    <sys:String x:Key="AppSubtitle">Mesh Networking</sys:String>
+
+    <!-- Connection -->
+    <sys:String x:Key="Connect">Connect</sys:String>
+    <sys:String x:Key="Disconnect">Disconnect</sys:String>
+    <sys:String x:Key="Connecting">Connecting...</sys:String>
+    <sys:String x:Key="Connected">Connected</sys:String>
+    <sys:String x:Key="Disconnected">Disconnected</sys:String>
+
+    <!-- Messaging -->
+    <sys:String x:Key="TypeMessage">Type a message...</sys:String>
+    <sys:String x:Key="Send">Send</sys:String>
+    <sys:String x:Key="Broadcast">Broadcast</sys:String>
+    <sys:String x:Key="SendTo">Send to</sys:String>
+
+    <!-- Peers -->
+    <sys:String x:Key="Peers">Peers</sys:String>
+    <sys:String x:Key="NoPeers">No peers found</sys:String>
+    <sys:String x:Key="Searching">Searching...</sys:String>
+
+    <!-- Actions -->
+    <sys:String x:Key="SendFile">Send File</sys:String>
+    <sys:String x:Key="CopyMessage">Copy Message</sys:String>
+    <sys:String x:Key="CopySender">Copy Sender</sys:String>
+
+    <!-- Network -->
+    <sys:String x:Key="NetworkLog">Activity</sys:String>
+    <sys:String x:Key="Encryption">Encryption</sys:String>
+
+    <!-- Settings -->
+    <sys:String x:Key="DisplayName">Display Name</sys:String>
+    <sys:String x:Key="Settings">Settings</sys:String>
+
+    <!-- Errors -->
+    <sys:String x:Key="ErrorSelectPeer">Select a peer to send message</sys:String>
+    <sys:String x:Key="ErrorConnectionFailed">Connection failed</sys:String>
+
+</ResourceDictionary>
