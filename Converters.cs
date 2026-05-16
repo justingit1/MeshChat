@@ -21,36 +21,22 @@ public class MessageAlignmentConverter : IMultiValueConverter
         => throw new NotImplementedException();
 }
 
-// Modern gradient bubbles - Fresh iMessage-style design
+// Clean broadcast bubbles using the TypeUI clean palette.
 public class BubbleColorConverter : IMultiValueConverter
 {
-    // Sent = Modern blue gradient (outgoing - user's messages)
     private static readonly LinearGradientBrush Sent = new()
     {
         StartPoint = new Point(0, 0),
         EndPoint = new Point(1, 1),
         GradientStops = new GradientStopCollection
         {
-            new GradientStop(Color.FromRgb(10, 132, 255), 0),    // Bright blue
-            new GradientStop(Color.FromRgb(0, 122, 255), 0.5),   // Blue
-            new GradientStop(Color.FromRgb(88, 86, 214), 1)      // Purple tint
+            new GradientStop(Color.FromRgb(59, 130, 246), 0),
+            new GradientStop(Color.FromRgb(139, 92, 246), 1)
         }
     };
 
-    // Received = Modern dark slate (incoming - from others)
-    private static readonly LinearGradientBrush Received = new()
-    {
-        StartPoint = new Point(0, 0),
-        EndPoint = new Point(1, 1),
-        GradientStops = new GradientStopCollection
-        {
-            new GradientStop(Color.FromRgb(58, 64, 72), 0),     // Dark gray
-            new GradientStop(Color.FromRgb(44, 46, 50), 1)      // Darker
-        }
-    };
-
-    // System messages = Subtle translucent
-    private static readonly SolidColorBrush System = new(Color.FromArgb(40, 100, 116, 139));
+    private static readonly SolidColorBrush Received = new(Color.FromRgb(255, 255, 255));
+    private static readonly SolidColorBrush System = new(Color.FromArgb(13, 17, 24, 39));
 
     public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
     {
@@ -67,14 +53,18 @@ public class BubbleColorConverter : IMultiValueConverter
         => throw new NotImplementedException();
 }
 
-// Sent text is white, received is white (both have white text now with 2026 design)
+// Sent text stays white; received text uses the clean text token.
 public class BubbleTextColorConverter : IMultiValueConverter
 {
     private static readonly SolidColorBrush White = new(Colors.White);
+    private static readonly SolidColorBrush Text = new(Color.FromRgb(17, 24, 39));
 
     public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
     {
-        return White;
+        if (values.Length >= 2 && values[0] is string senderId && values[1] is string localId)
+            return senderId == localId ? White : Text;
+
+        return Text;
     }
     public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture)
         => throw new NotImplementedException();
@@ -106,8 +96,8 @@ public class MessageStatusConverter : IValueConverter
 // Read receipts turn blue, others are gray
 public class StatusColorConverter : IValueConverter
 {
-    private static readonly SolidColorBrush Blue = new(Color.FromRgb(37, 99, 235));     // iOS Blue for read
-    private static readonly SolidColorBrush Gray = new(Color.FromRgb(148, 163, 184));   // Gray for sent/delivered
+    private static readonly SolidColorBrush Blue = new(Color.FromRgb(59, 130, 246));
+    private static readonly SolidColorBrush Gray = new(Color.FromArgb(153, 17, 24, 39));
 
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
         => value is MessageStatus.Read ? Blue : Gray;
@@ -118,9 +108,9 @@ public class StatusColorConverter : IValueConverter
 // Peer online dot color
 public class PeerStatusColorConverter : IValueConverter
 {
-    private static readonly SolidColorBrush OnlineBrush = new(Color.FromRgb(34, 197, 94));
-    private static readonly SolidColorBrush AwayBrush = new(Color.FromRgb(245, 158, 11));
-    private static readonly SolidColorBrush OfflineBrush = new(Color.FromRgb(148, 163, 184));
+    private static readonly SolidColorBrush OnlineBrush = new(Color.FromRgb(22, 163, 74));
+    private static readonly SolidColorBrush AwayBrush = new(Color.FromRgb(217, 119, 6));
+    private static readonly SolidColorBrush OfflineBrush = new(Color.FromArgb(153, 17, 24, 39));
 
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
     {

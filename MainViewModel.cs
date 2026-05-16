@@ -367,6 +367,9 @@ public partial class MainViewModel : INotifyPropertyChanged
         _fileTransfer.ProgressUpdated += OnFileProgress;
         _fileTransfer.FileReceived += OnFileReceived;
         _fileTransfer.LogMessage += AddLog;
+
+        Messages.CollectionChanged += (_, _) => OnPropertyChanged(nameof(FilteredMessages));
+        Logs.CollectionChanged += (_, _) => OnPropertyChanged(nameof(FilteredLogs));
     }
 
     // ─── Startup ────────────────────────────────────────────────────────────
@@ -662,7 +665,11 @@ public partial class MainViewModel : INotifyPropertyChanged
         else
         {
             // Viewing a different peer — increment unread badge
-            if (_peerById.TryGetValue(peerId, out var peer)) peer.UnreadCount++;
+            if (_peerById.TryGetValue(peerId, out var peer))
+            {
+                peer.UnreadCount++;
+                UpdateUnreadCounts();
+            }
         }
 
         // Send delivery receipt
@@ -708,6 +715,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         bool isAdding = ToggleReaction(msg, emoji, _wifi.LocalId);
 
         // Notify property changed to update UI
+        msg.NotifyReactionsChanged();
         OnPropertyChanged(nameof(Messages));
 
         // Send reaction to network
@@ -768,6 +776,7 @@ public partial class MainViewModel : INotifyPropertyChanged
             }
 
             // Notify property changed
+            msg.NotifyReactionsChanged();
             OnPropertyChanged(nameof(Messages));
 
             // Log the reaction
@@ -1007,10 +1016,7 @@ public partial class MainViewModel : INotifyPropertyChanged
 
     private void UpdateUnreadCounts()
     {
-        int total = Peers.Sum(p => p.UnreadCount);
-        if (_messageHistory.TryGetValue("broadcast", out var broadcast))
-            total += broadcast.Count(m => m.SenderId != _wifi.LocalId && m.Type != MessageType.System);
-        TotalUnreadCount = total;
+        TotalUnreadCount = Peers.Sum(p => p.UnreadCount);
     }
 
     // ─── Typing Indicator Helpers ───────────────────────────────────────────

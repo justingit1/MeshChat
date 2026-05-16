@@ -190,40 +190,40 @@
             <Style x:Key="PrimaryButton" TargetType="Button">
                 <Setter Property="Background" Value="{StaticResource PrimaryBrush}"/>
                 <Setter Property="Foreground" Value="White"/>
-                <Setter Property="BorderThickness" Value="0"/>
-                <Setter Property="Padding" Value="16,10"/>
+                <Setter Property="BorderBrush" Value="{StaticResource PrimaryDarkBrush}"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Padding" Value="16,9"/>
+                <Setter Property="MinHeight" Value="36"/>
                 <Setter Property="FontSize" Value="14"/>
-                <Setter Property="FontWeight" Value="Medium"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
                 <Setter Property="Cursor" Value="Hand"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
                             <Border x:Name="border" Background="{TemplateBinding Background}"
-                                    CornerRadius="10" Padding="{TemplateBinding Padding}">
-                                <Border.Effect>
-                                    <DropShadowEffect BlurRadius="8" ShadowDepth="0" Opacity="0.3" Color="#0A84FF"/>
-                                </Border.Effect>
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="8" Padding="{TemplateBinding Padding}">
                                 <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="border" Property="Background" Value="#3399FF"/>
-                                    <Setter TargetName="border" Property="Effect">
-                                        <Setter.Value>
-                                            <DropShadowEffect BlurRadius="12" ShadowDepth="0" Opacity="0.5" Color="#0A84FF"/>
-                                        </Setter.Value>
-                                    </Setter>
+                                    <Setter TargetName="border" Property="Background" Value="#2563EB"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#60A5FA"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter TargetName="border" Property="Background" Value="#007AFF"/>
-                                    <Setter TargetName="border" Property="Effect">
-                                        <Setter.Value>
-                                            <DropShadowEffect BlurRadius="4" ShadowDepth="0" Opacity="0.2" Color="#0A84FF"/>
-                                        </Setter.Value>
-                                    </Setter>
+                                    <Setter TargetName="border" Property="Background" Value="#1D4ED8"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#93C5FD"/>
+                                </Trigger>
+                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#BFDBFE"/>
+                                    <Setter TargetName="border" Property="BorderThickness" Value="2"/>
                                 </Trigger>
                                 <Trigger Property="IsEnabled" Value="False">
-                                    <Setter Property="Opacity" Value="0.4"/>
+                                    <Setter Property="Cursor" Value="Arrow"/>
+                                    <Setter TargetName="border" Property="Background" Value="#4B5563"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#6B7280"/>
+                                    <Setter Property="Opacity" Value="0.55"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -234,21 +234,34 @@
             <Style x:Key="GlassButton" TargetType="Button">
                 <Setter Property="Background" Value="Transparent"/>
                 <Setter Property="Foreground" Value="White"/>
-                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="BorderBrush" Value="#24FFFFFF"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="MinHeight" Value="32"/>
                 <Setter Property="Cursor" Value="Hand"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
                             <Border x:Name="border" Background="{TemplateBinding Background}"
-                                    CornerRadius="19" Padding="0">
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="8" Padding="{TemplateBinding Padding}">
                                 <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="border" Property="Background" Value="#1A0A84FF"/>
+                                    <Setter TargetName="border" Property="Background" Value="#14FFFFFF"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#38FFFFFF"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter TargetName="border" Property="Background" Value="#330A84FF"/>
+                                    <Setter TargetName="border" Property="Background" Value="#24FFFFFF"/>
+                                </Trigger>
+                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                    <Setter TargetName="border" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                                    <Setter TargetName="border" Property="BorderThickness" Value="2"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Cursor" Value="Arrow"/>
+                                    <Setter Property="Opacity" Value="0.55"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -258,35 +271,37 @@
 
             <Style x:Key="IconButton" TargetType="Button">
                 <Setter Property="Background" Value="Transparent"/>
-                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="BorderBrush" Value="Transparent"/>
+                <Setter Property="BorderThickness" Value="1"/>
                 <Setter Property="Cursor" Value="Hand"/>
                 <Setter Property="Padding" Value="8"/>
+                <Setter Property="MinWidth" Value="32"/>
+                <Setter Property="MinHeight" Value="32"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
                             <Border x:Name="border" Background="{TemplateBinding Background}"
                                     CornerRadius="8" Padding="{TemplateBinding Padding}"
-                                    BorderBrush="Transparent" BorderThickness="1">
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}">
                                 <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="border" Property="Background" Value="#1AFFFFFF"/>
-                                    <Setter TargetName="border" Property="BorderBrush" Value="#29FFFFFF"/>
-                                    <Setter TargetName="border" Property="Effect">
-                                        <Setter.Value>
-                                            <DropShadowEffect BlurRadius="8" ShadowDepth="0" Opacity="0.3" Color="#0A84FF"/>
-                                        </Setter.Value>
-                                    </Setter>
+                                    <Setter TargetName="border" Property="Background" Value="#14FFFFFF"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#38FFFFFF"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter TargetName="border" Property="Background" Value="#33000000"/>
+                                    <Setter TargetName="border" Property="Background" Value="#24FFFFFF"/>
                                     <Setter TargetName="border" Property="BorderBrush" Value="#4DFFFFFF"/>
-                                    <Setter TargetName="border" Property="Effect">
-                                        <Setter.Value>
-                                            <DropShadowEffect BlurRadius="4" ShadowDepth="0" Opacity="0.2" Color="#0A84FF"/>
-                                        </Setter.Value>
-                                    </Setter>
+                                </Trigger>
+                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                    <Setter TargetName="border" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                                    <Setter TargetName="border" Property="BorderThickness" Value="2"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Cursor" Value="Arrow"/>
+                                    <Setter Property="Opacity" Value="0.55"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -294,10 +309,11 @@
                 </Setter>
             </Style>
 
-            <!-- Modern Send Button with Glow Animation -->
+            <!-- Clean send action button -->
             <Style x:Key="SendButton" TargetType="Button">
-                <Setter Property="Background" Value="Transparent"/>
-                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Background" Value="{StaticResource PrimaryBrush}"/>
+                <Setter Property="BorderBrush" Value="{StaticResource PrimaryDarkBrush}"/>
+                <Setter Property="BorderThickness" Value="1"/>
                 <Setter Property="Cursor" Value="Hand"/>
                 <Setter Property="Padding" Value="0"/>
                 <Setter Property="Width" Value="40"/>
@@ -305,16 +321,10 @@
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
-                            <Border x:Name="border" CornerRadius="20" Width="40" Height="40">
-                                <Border.Background>
-                                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-                                        <GradientStop Color="#0A84FF" Offset="0"/>
-                                        <GradientStop Color="#5856D6" Offset="1"/>
-                                    </LinearGradientBrush>
-                                </Border.Background>
-                                <Border.Effect>
-                                    <DropShadowEffect x:Name="glowEffect" BlurRadius="12" ShadowDepth="0" Opacity="0.4" Color="#0A84FF"/>
-                                </Border.Effect>
+                            <Border x:Name="border" Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="20" Width="40" Height="40">
                                 <TextBlock Text="&#x2191;" FontSize="18" Foreground="White"
                                            HorizontalAlignment="Center" VerticalAlignment="Center"
                                            FontWeight="SemiBold" RenderTransformOrigin="0.5,0.5">
@@ -325,18 +335,22 @@
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="border" Property="Effect">
-                                        <Setter.Value>
-                                            <DropShadowEffect BlurRadius="20" ShadowDepth="0" Opacity="0.6" Color="#0A84FF"/>
-                                        </Setter.Value>
-                                    </Setter>
+                                    <Setter TargetName="border" Property="Background" Value="#2563EB"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#60A5FA"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter TargetName="border" Property="Effect">
-                                        <Setter.Value>
-                                            <DropShadowEffect BlurRadius="8" ShadowDepth="0" Opacity="0.3" Color="#0A84FF"/>
-                                        </Setter.Value>
-                                    </Setter>
+                                    <Setter TargetName="border" Property="Background" Value="#1D4ED8"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#93C5FD"/>
+                                </Trigger>
+                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#BFDBFE"/>
+                                    <Setter TargetName="border" Property="BorderThickness" Value="2"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Cursor" Value="Arrow"/>
+                                    <Setter TargetName="border" Property="Background" Value="#4B5563"/>
+                                    <Setter TargetName="border" Property="BorderBrush" Value="#6B7280"/>
+                                    <Setter Property="Opacity" Value="0.55"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -353,6 +367,7 @@
                 <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
                 <Setter Property="BorderThickness" Value="1"/>
                 <Setter Property="Padding" Value="14,12"/>
+                <Setter Property="MinHeight" Value="38"/>
                 <Setter Property="FontSize" Value="14"/>
                 <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
                 <Setter Property="CaretBrush" Value="{StaticResource AccentBrush}"/>
@@ -362,34 +377,17 @@
                             <Border x:Name="border" Background="{TemplateBinding Background}"
                                     BorderBrush="{TemplateBinding BorderBrush}"
                                     BorderThickness="{TemplateBinding BorderThickness}"
-                                    CornerRadius="12">
-                                <Border.Effect>
-                                    <DropShadowEffect x:Name="borderGlow" BlurRadius="0" ShadowDepth="0" Opacity="0" Color="#0A84FF"/>
-                                </Border.Effect>
+                                    CornerRadius="8">
                                 <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsFocused" Value="True">
                                     <Setter TargetName="border" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
                                     <Setter TargetName="border" Property="Background" Value="{StaticResource SidebarHoverBrush}"/>
-                                    <Trigger.EnterActions>
-                                        <BeginStoryboard>
-                                            <Storyboard>
-                                                <DoubleAnimation Storyboard.TargetName="borderGlow" Storyboard.TargetProperty="BlurRadius"
-                                                                 To="8" Duration="0:0:0.2"/>
-                                                <DoubleAnimation Storyboard.TargetName="borderGlow" Storyboard.TargetProperty="Opacity"
-                                                                 To="0.3" Duration="0:0:0.2"/>
-                                            </Storyboard>
-                                        </BeginStoryboard>
-                                    </Trigger.EnterActions>
-                                    <Trigger.ExitActions>
-                                        <BeginStoryboard>
-                                            <Storyboard>
-                                                <DoubleAnimation Storyboard.TargetName="borderGlow" Storyboard.TargetProperty="Opacity"
-                                                                 To="0" Duration="0:0:0.2"/>
-                                            </Storyboard>
-                                        </BeginStoryboard>
-                                    </Trigger.ExitActions>
+                                    <Setter TargetName="border" Property="BorderThickness" Value="2"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.55"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -405,6 +403,7 @@
                 <Setter Property="FontSize" Value="15"/>
                 <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
                 <Setter Property="CaretBrush" Value="{StaticResource AccentBrush}"/>
+                <Setter Property="MinHeight" Value="40"/>
             </Style>
 
             <!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -431,10 +430,12 @@
                 <Setter Property="BorderThickness" Value="0"/>
                 <Setter Property="Padding" Value="0"/>
                 <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="ListBoxItem">
-                            <Border x:Name="bd" Background="Transparent" Padding="12,10">
+                            <Border x:Name="bd" Background="Transparent" Padding="12,10"
+                                    BorderBrush="Transparent" BorderThickness="1">
                                 <ContentPresenter/>
                             </Border>
                             <ControlTemplate.Triggers>
@@ -443,6 +444,9 @@
                                 </Trigger>
                                 <Trigger Property="IsSelected" Value="True">
                                     <Setter TargetName="bd" Property="Background" Value="{StaticResource SidebarActiveBrush}"/>
+                                </Trigger>
+                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>

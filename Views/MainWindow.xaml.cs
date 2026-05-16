@@ -92,8 +92,8 @@ public partial class MainWindow : Window
             // Play smooth modern animations on load
             PlayStartupAnimations();
 
-            // Start services after window is fully rendered
-            await Task.Run(() => _vm.StartAsync());
+            // Start services after window is fully rendered.
+            await _vm.StartAsync();
             UpdateTitle();
         };
         Closing += (_, _) => _vm.Stop();
