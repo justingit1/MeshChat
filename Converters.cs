@@ -21,7 +21,8 @@ public class MessageAlignmentConverter : IMultiValueConverter
         => throw new NotImplementedException();
 }
 
-// Clean broadcast bubbles using the TypeUI clean palette.
+// Dark-mode bubble colors: outgoing messages use the blue/purple accent gradient,
+// while incoming cards stay muted so broadcasts never flash as bright white.
 public class BubbleColorConverter : IMultiValueConverter
 {
     private static readonly LinearGradientBrush Sent = new()
@@ -35,8 +36,8 @@ public class BubbleColorConverter : IMultiValueConverter
         }
     };
 
-    private static readonly SolidColorBrush Received = new(Color.FromRgb(255, 255, 255));
-    private static readonly SolidColorBrush System = new(Color.FromArgb(13, 17, 24, 39));
+    private static readonly SolidColorBrush Received = new(Color.FromRgb(45, 45, 68));
+    private static readonly SolidColorBrush System = new(Color.FromRgb(36, 36, 58));
 
     public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
     {
@@ -53,11 +54,11 @@ public class BubbleColorConverter : IMultiValueConverter
         => throw new NotImplementedException();
 }
 
-// Sent text stays white; received text uses the clean text token.
+// Keep both directions readable on dark surfaces; received text uses #E5E7EB.
 public class BubbleTextColorConverter : IMultiValueConverter
 {
     private static readonly SolidColorBrush White = new(Colors.White);
-    private static readonly SolidColorBrush Text = new(Color.FromRgb(17, 24, 39));
+    private static readonly SolidColorBrush Text = new(Color.FromRgb(229, 231, 235));
 
     public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
     {
@@ -93,11 +94,11 @@ public class MessageStatusConverter : IValueConverter
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) => Binding.DoNothing;
 }
 
-// Read receipts turn blue, others are gray
+// Read receipts turn blue, other message states use secondary dark-mode text.
 public class StatusColorConverter : IValueConverter
 {
     private static readonly SolidColorBrush Blue = new(Color.FromRgb(59, 130, 246));
-    private static readonly SolidColorBrush Gray = new(Color.FromArgb(153, 17, 24, 39));
+    private static readonly SolidColorBrush Gray = new(Color.FromRgb(139, 139, 158));
 
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
         => value is MessageStatus.Read ? Blue : Gray;

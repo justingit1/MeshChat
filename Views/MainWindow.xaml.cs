@@ -68,7 +68,7 @@ public partial class MainWindow : Window
         _vm = new MainViewModel();
         DataContext = _vm;
 
-        // Auto-scroll messages when new ones arrive
+        // Auto-scroll the virtualized message list without forcing every item container to be created.
         _vm.Messages.CollectionChanged += Messages_CollectionChanged;
 
         // Handle network log toggle with animation
@@ -170,7 +170,8 @@ public partial class MainWindow : Window
         {
             Dispatcher.InvokeAsync(() =>
             {
-                MessagesScrollViewer.ScrollToBottom();
+                if (_vm.FilteredMessages.LastOrDefault() is ChatMessage lastMessage)
+                    MessagesList.ScrollIntoView(lastMessage);
             }, System.Windows.Threading.DispatcherPriority.Loaded);
         }
     }

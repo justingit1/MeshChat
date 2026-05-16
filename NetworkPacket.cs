@@ -38,15 +38,6 @@ public class NetworkPacket
     public PeerInfo[]? KnownPeers { get; set; }
 }
 
-public class PeerInfo
-{
-    public string Id { get; set; } = string.Empty;
-    public string Name { get; set; } = string.Empty;
-    public string? IpAddress { get; set; }
-    public int Port { get; set; }
-    public int HopsAway { get; set; }
-}
-
 // Reaction payload for message reactions
 public class ReactionPayload
 {

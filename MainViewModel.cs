@@ -1,15 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.ComponentModel;
 using System.Linq;
 using System.Media;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using MeshChat.Models;
 using MeshChat.Services;
@@ -18,7 +17,7 @@ using System.Runtime.InteropServices;
 
 namespace MeshChat.ViewModels;
 
-public partial class MainViewModel : INotifyPropertyChanged
+public partial class MainViewModel : ObservableObject
 {
     private readonly WiFiService _wifi;
     private readonly BluetoothService _bluetooth;
@@ -38,8 +37,9 @@ public partial class MainViewModel : INotifyPropertyChanged
         get => _selectedPeer;
         set
         {
-            _selectedPeer = value;
-            OnPropertyChanged();
+            if (!SetProperty(ref _selectedPeer, value))
+                return;
+
             // Use dispatcher to ensure thread safety
             _dispatcher.Invoke(() =>
             {
@@ -49,26 +49,22 @@ public partial class MainViewModel : INotifyPropertyChanged
         }
     }
 
+    [ObservableProperty]
     private string _messageInput = string.Empty;
+
     private DateTime _lastTypingSent = DateTime.MinValue;
     private const int TypingSendIntervalMs = 2000; // Send typing every 2 seconds
 
-    public string MessageInput
+    partial void OnMessageInputChanged(string value)
     {
-        get => _messageInput;
-        set
+        // Send typing indicator when user starts typing
+        if (!string.IsNullOrEmpty(value) && SelectedPeer != null)
         {
-            _messageInput = value;
-            OnPropertyChanged();
-            // Send typing indicator when user starts typing
-            if (!string.IsNullOrEmpty(value) && SelectedPeer != null)
+            var now = DateTime.Now;
+            if ((now - _lastTypingSent).TotalMilliseconds > TypingSendIntervalMs)
             {
-                var now = DateTime.Now;
-                if ((now - _lastTypingSent).TotalMilliseconds > TypingSendIntervalMs)
-                {
-                    _lastTypingSent = now;
-                    _ = SendTypingIndicatorAsync();
-                }
+                _lastTypingSent = now;
+                _ = SendTypingIndicatorAsync();
             }
         }
     }
@@ -88,17 +84,9 @@ public partial class MainViewModel : INotifyPropertyChanged
         await SendToPeerViaTransportAsync(SelectedPeer.Id, packet);
     }
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(FilteredMessages))]
     private string _searchQuery = string.Empty;
-    public string SearchQuery
-    {
-        get => _searchQuery;
-        set
-        {
-            _searchQuery = value;
-            OnPropertyChanged();
-            OnPropertyChanged(nameof(FilteredMessages));
-        }
-    }
 
     public IEnumerable<ChatMessage> FilteredMessages
     {
@@ -118,17 +106,9 @@ public partial class MainViewModel : INotifyPropertyChanged
     // Log filter options
     public string[] LogFilterOptions { get; } = { "All", "WiFi", "Bluetooth", "Errors", "Messages" };
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(FilteredLogs))]
     private string _logFilter = "All";
-    public string LogFilter
-    {
-        get => _logFilter;
-        set
-        {
-            _logFilter = value;
-            OnPropertyChanged();
-            OnPropertyChanged(nameof(FilteredLogs));
-        }
-    }
 
     public IEnumerable<LogEntry> FilteredLogs
     {
@@ -150,12 +130,8 @@ public partial class MainViewModel : INotifyPropertyChanged
         }
     }
 
+    [ObservableProperty]
     private string _displayName = string.Empty;
-    public string DisplayName
-    {
-        get => _displayName;
-        set { _displayName = value; OnPropertyChanged(); }
-    }
 
     private bool _encryptionEnabled = false;
     public bool EncryptionEnabled
@@ -184,21 +160,14 @@ public partial class MainViewModel : INotifyPropertyChanged
     public string LocalId => _wifi.LocalId;
 
     // Toast notification properties
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ToastVisible))]
     private string _toastMessage = string.Empty;
-    public string ToastMessage
-    {
-        get => _toastMessage;
-        set { _toastMessage = value; OnPropertyChanged(); OnPropertyChanged(nameof(ToastVisible)); }
-    }
 
-    public bool ToastVisible => !string.IsNullOrEmpty(_toastMessage);
+    public bool ToastVisible => !string.IsNullOrEmpty(ToastMessage);
 
+    [ObservableProperty]
     private bool _toastIsError;
-    public bool ToastIsError
-    {
-        get => _toastIsError;
-        set { _toastIsError = value; OnPropertyChanged(); }
-    }
 
     public void ShowToast(string message, bool isError = false)
     {
@@ -213,54 +182,26 @@ public partial class MainViewModel : INotifyPropertyChanged
         ToastMessage = string.Empty;
     }
 
+    [ObservableProperty]
     private string _statusText = "Not connected";
-    public string StatusText
-    {
-        get => _statusText;
-        set { _statusText = value; OnPropertyChanged(); }
-    }
 
+    [ObservableProperty]
     private bool _isWifiConnected;
-    public bool IsWifiConnected
-    {
-        get => _isWifiConnected;
-        set { _isWifiConnected = value; OnPropertyChanged(); }
-    }
 
+    [ObservableProperty]
     private bool _isBluetoothAvailable;
-    public bool IsBluetoothAvailable
-    {
-        get => _isBluetoothAvailable;
-        set { _isBluetoothAvailable = value; OnPropertyChanged(); }
-    }
 
+    [ObservableProperty]
     private string _connectIp = string.Empty;
-    public string ConnectIp
-    {
-        get => _connectIp;
-        set { _connectIp = value; OnPropertyChanged(); }
-    }
 
+    [ObservableProperty]
     private string _connectPort = "45678";
-    public string ConnectPort
-    {
-        get => _connectPort;
-        set { _connectPort = value; OnPropertyChanged(); }
-    }
 
     // ─── Unread Badge for Title ─────────────────────────────────────────────
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(TitleWithUnread))]
     private int _totalUnreadCount;
-    public int TotalUnreadCount
-    {
-        get => _totalUnreadCount;
-        private set
-        {
-            _totalUnreadCount = value;
-            OnPropertyChanged();
-            OnPropertyChanged(nameof(TitleWithUnread));
-        }
-    }
 
     public string TitleWithUnread => TotalUnreadCount > 0
         ? $"MeshChat — Offline P2P Messenger ({TotalUnreadCount} unread)"
@@ -268,30 +209,18 @@ public partial class MainViewModel : INotifyPropertyChanged
 
     // ─── Typing Indicator ───────────────────────────────────────────────────
 
+    [ObservableProperty]
     private bool _isPeerTyping;
-    public bool IsPeerTyping
-    {
-        get => _isPeerTyping;
-        private set { _isPeerTyping = value; OnPropertyChanged(); }
-    }
 
+    [ObservableProperty]
     private string _typingPeerName = string.Empty;
-    public string TypingPeerName
-    {
-        get => _typingPeerName;
-        private set { _typingPeerName = value; OnPropertyChanged(); }
-    }
 
     private readonly Dictionary<string, DateTime> _typingTimers = [];
     private const int TypingIndicatorDurationMs = 3000;
 
     // ─── UI State ───────────────────────────────────────────────────────────
+    [ObservableProperty]
     private bool _isNetworkLogVisible = true; // Default to visible for debugging
-    public bool IsNetworkLogVisible
-    {
-        get => _isNetworkLogVisible;
-        set { _isNetworkLogVisible = value; OnPropertyChanged(); }
-    }
 
     [RelayCommand]
     private void ToggleNetworkLog()
@@ -351,7 +280,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         DisplayName = Environment.MachineName;
 
         // Load persisted messages
-        LoadPersistedMessages();
+        _ = LoadPersistedMessagesAsync();
 
         // Wire up events
         _wifi.PeerDiscovered += OnPeerDiscovered;
@@ -527,7 +456,7 @@ public partial class MainViewModel : INotifyPropertyChanged
             await SendToPeerViaTransportAsync(SelectedPeer.Id, packet);
         }
 
-        msg.Status = MessageStatus.Sent;
+        msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
         OnPropertyChanged(nameof(Messages));
     }
 
@@ -555,11 +484,14 @@ public partial class MainViewModel : INotifyPropertyChanged
             }
             else
             {
-                existing.Status = PeerStatus.Online;
-                existing.LastSeen = DateTime.Now;
+                existing = ReplacePeer(existing, existing with
+                {
+                    Status = PeerStatus.Online,
+                    LastSeen = DateTime.Now
+                });
                 // Update transport if it changed (e.g. WiFi → Both)
                 if (existing.Transport != peer.Transport)
-                    existing.Transport = peer.Transport;
+                    ReplacePeer(existing, existing with { Transport = peer.Transport });
             }
         });
     }
@@ -570,7 +502,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         {
             if (_peerById.TryGetValue(peerId, out var peer))
             {
-                peer.Status = PeerStatus.Offline;
+                ReplacePeer(peer, peer with { Status = PeerStatus.Offline });
                 AddLog($"Peer left: {peer.DisplayName}");
 
                 var sysMsg = new ChatMessage
@@ -593,7 +525,7 @@ public partial class MainViewModel : INotifyPropertyChanged
             switch (packet.Type)
             {
                 case PacketType.Message:
-                    HandleIncomingMessage(packet);
+                    _ = HandleIncomingMessageAsync(packet);
                     break;
 
                 case PacketType.MessageAck:
@@ -623,7 +555,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         });
     }
 
-    private async void HandleIncomingMessage(NetworkPacket packet)
+    private async Task HandleIncomingMessageAsync(NetworkPacket packet)
     {
         if (packet.Payload == null) return;
 
@@ -636,7 +568,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         var msg = JsonConvert.DeserializeObject<ChatMessage>(payload);
         if (msg == null) return;
 
-        msg.Status = MessageStatus.Delivered;
+        msg = msg with { Status = MessageStatus.Delivered };
 
         var peerId = packet.SenderId;
         AddMessageToHistory(peerId, msg);
@@ -667,7 +599,7 @@ public partial class MainViewModel : INotifyPropertyChanged
             // Viewing a different peer — increment unread badge
             if (_peerById.TryGetValue(peerId, out var peer))
             {
-                peer.UnreadCount++;
+                ReplacePeer(peer, peer with { UnreadCount = peer.UnreadCount + 1 });
                 UpdateUnreadCounts();
             }
         }
@@ -692,14 +624,14 @@ public partial class MainViewModel : INotifyPropertyChanged
     {
         var msgId = packet.Payload;
         if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
-            msg.Status = MessageStatus.Delivered;
+            ReplaceMessage(msg, msg with { Status = MessageStatus.Delivered });
     }
 
     private void HandleReadReceipt(NetworkPacket packet)
     {
         var msgId = packet.Payload;
         if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
-            msg.Status = MessageStatus.Read;
+            ReplaceMessage(msg, msg with { Status = MessageStatus.Read });
     }
 
     public async Task AddReactionAsync(string messageId, string emoji)
@@ -707,12 +639,9 @@ public partial class MainViewModel : INotifyPropertyChanged
         // Find the message
         if (!_messageById.TryGetValue(messageId, out var msg)) return;
 
-        // Initialize reactions dict if null
-        if (msg.Reactions == null)
-            msg.Reactions = new Dictionary<string, List<string>>();
-
         // Toggle reaction: add if not present, remove if present
         bool isAdding = ToggleReaction(msg, emoji, _wifi.LocalId);
+        msg = ReplaceMessage(msg, msg with { Reactions = CloneReactions(msg.Reactions) });
 
         // Notify property changed to update UI
         msg.NotifyReactionsChanged();
@@ -762,10 +691,6 @@ public partial class MainViewModel : INotifyPropertyChanged
 
             if (!_messageById.TryGetValue(reaction.MessageId, out var msg)) return;
 
-            // Initialize reactions dict if null
-            if (msg.Reactions == null)
-                msg.Reactions = new Dictionary<string, List<string>>();
-
             if (reaction.IsAdded)
             {
                 AddReactionUser(msg, reaction.Emoji, reaction.UserId);
@@ -774,6 +699,8 @@ public partial class MainViewModel : INotifyPropertyChanged
             {
                 RemoveReactionUser(msg, reaction.Emoji, reaction.UserId);
             }
+
+            msg = ReplaceMessage(msg, msg with { Reactions = CloneReactions(msg.Reactions) });
 
             // Notify property changed
             msg.NotifyReactionsChanged();
@@ -793,7 +720,8 @@ public partial class MainViewModel : INotifyPropertyChanged
     {
         _dispatcher.Invoke(() =>
         {
-            if (_messageById.TryGetValue(msgId, out var msg)) msg.FileProgress = progress;
+            if (_messageById.TryGetValue(msgId, out var msg))
+                ReplaceMessage(msg, msg with { FileProgress = progress });
         });
     }
 
@@ -803,9 +731,12 @@ public partial class MainViewModel : INotifyPropertyChanged
         {
             if (_messageById.TryGetValue(msgId, out var msg))
             {
-                msg.FilePath = savedPath;
-                msg.Status = MessageStatus.Delivered;
-                msg.FileProgress = 1.0;
+                ReplaceMessage(msg, msg with
+                {
+                    FilePath = savedPath,
+                    Status = MessageStatus.Delivered,
+                    FileProgress = 1.0
+                });
             }
             AddLog($"File received and saved to {savedPath}");
         });
@@ -819,10 +750,51 @@ public partial class MainViewModel : INotifyPropertyChanged
             _messageHistory[peerId] = history = [];
         history.Add(msg);
         IndexMessage(msg);
-        SaveMessagesAsync();
+        _ = SaveMessagesAsync();
     }
 
-    private async void LoadPersistedMessages()
+    private ChatMessage ReplaceMessage(ChatMessage current, ChatMessage updated)
+    {
+        foreach (var history in _messageHistory.Values)
+        {
+            for (var i = 0; i < history.Count; i++)
+            {
+                if (history[i].Id == current.Id)
+                    history[i] = updated;
+            }
+        }
+
+        for (var i = 0; i < Messages.Count; i++)
+        {
+            if (Messages[i].Id == current.Id)
+                Messages[i] = updated;
+        }
+
+        _messageById[updated.Id] = updated;
+        IndexReactions(updated);
+        _ = SaveMessagesAsync();
+        return updated;
+    }
+
+    private Peer ReplacePeer(Peer current, Peer updated)
+    {
+        _peerById[updated.Id] = updated;
+
+        for (var i = 0; i < Peers.Count; i++)
+        {
+            if (Peers[i].Id == current.Id)
+                Peers[i] = updated;
+        }
+
+        if (SelectedPeer?.Id == current.Id)
+        {
+            SetProperty(ref _selectedPeer, updated, nameof(SelectedPeer));
+        }
+
+        return updated;
+    }
+
+    private async Task LoadPersistedMessagesAsync()
     {
         try
         {
@@ -844,7 +816,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private async void SaveMessagesAsync()
+    private async Task SaveMessagesAsync()
     {
         try
         {
@@ -884,13 +856,14 @@ public partial class MainViewModel : INotifyPropertyChanged
     private void IndexReactions(ChatMessage msg)
     {
         var indexed = new Dictionary<string, HashSet<string>>();
-        if (msg.Reactions != null)
-        {
-            foreach (var reaction in msg.Reactions)
-                indexed[reaction.Key] = new HashSet<string>(reaction.Value);
-        }
+        foreach (var reaction in msg.Reactions)
+            indexed[reaction.Key] = new HashSet<string>(reaction.Value);
+
         _reactionUsersByMessage[msg.Id] = indexed;
     }
+
+    private static Dictionary<string, List<string>> CloneReactions(Dictionary<string, List<string>> reactions)
+        => reactions.ToDictionary(reaction => reaction.Key, reaction => reaction.Value.ToList());
 
     private Dictionary<string, HashSet<string>> GetReactionIndex(ChatMessage msg)
     {
@@ -918,7 +891,6 @@ public partial class MainViewModel : INotifyPropertyChanged
 
     private void AddReactionUser(ChatMessage msg, string emoji, string userId)
     {
-        msg.Reactions ??= new Dictionary<string, List<string>>();
         var reactions = GetReactionIndex(msg);
 
         if (!reactions.TryGetValue(emoji, out var users))
@@ -934,7 +906,6 @@ public partial class MainViewModel : INotifyPropertyChanged
 
     private void RemoveReactionUser(ChatMessage msg, string emoji, string userId)
     {
-        msg.Reactions ??= new Dictionary<string, List<string>>();
         var reactions = GetReactionIndex(msg);
 
         if (!reactions.TryGetValue(emoji, out var users) || !users.Remove(userId))
@@ -963,7 +934,7 @@ public partial class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        peer.UnreadCount = 0;
+        peer = ReplacePeer(peer, peer with { UnreadCount = 0 });
 
         if (_messageHistory.TryGetValue(peer.Id, out var history))
             LoadMessagesWithDateSeparators(history);
@@ -1195,9 +1166,4 @@ public partial class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    // ─── INotifyPropertyChanged ─────────────────────────────────────────────
-
-    public event PropertyChangedEventHandler? PropertyChanged;
-    protected void OnPropertyChanged([CallerMemberName] string? name = null)
-        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
