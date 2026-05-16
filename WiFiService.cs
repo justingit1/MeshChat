@@ -24,7 +24,8 @@ public class WiFiService : IDisposable
     private MulticastService? _multicast;
     private ServiceDiscovery? _serviceDiscovery;
     private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
-    private readonly ConcurrentDictionary<string, string> _seenPacketIds = new();
+    private readonly ConcurrentDictionary<string, byte> _seenPacketIds = new();
+    private readonly ConcurrentQueue<string> _seenPacketOrder = new();
     private CancellationTokenSource _cts = new();
 
     public string LocalId { get; private set; } = Guid.NewGuid().ToString();
@@ -158,9 +159,7 @@ public class WiFiService : IDisposable
                     });
                 }
 
-                if (_seenPacketIds.ContainsKey(packet.Id)) continue;
-                _seenPacketIds[packet.Id] = string.Empty;
-                CleanupPacketIdCache();
+                if (!MarkPacketSeen(packet.Id)) continue;
 
                 // FIXED: Removed the [...] syntax that caused the error on line 123
                 if (packet.Ttl > 1 && packet.TargetId != LocalId && packet.TargetId != null)
@@ -192,25 +191,26 @@ public class WiFiService : IDisposable
         await Task.WhenAll(tasks);
     }
 
-    private void CleanupPacketIdCache()
+    private bool MarkPacketSeen(string packetId)
     {
-        if (_seenPacketIds.Count > MaxPacketIdCacheSize)
+        if (!_seenPacketIds.TryAdd(packetId, 0))
+            return false;
+
+        _seenPacketOrder.Enqueue(packetId);
+        while (_seenPacketIds.Count > MaxPacketIdCacheSize &&
+               _seenPacketOrder.TryDequeue(out var oldPacketId))
         {
-            // Clear half the entries when exceeding limit
-            var keysToRemove = _seenPacketIds.Keys.Take(_seenPacketIds.Count / 2).ToList();
-            foreach (var key in keysToRemove)
-            {
-                _seenPacketIds.TryRemove(key, out _);
-            }
+            _seenPacketIds.TryRemove(oldPacketId, out _);
         }
+
+        return true;
     }
 
     public async Task SendToAllAsync(NetworkPacket packet)
     {
         packet.SenderId = LocalId;
         packet.SenderName = LocalName;
-        _seenPacketIds[packet.Id] = string.Empty;
-        CleanupPacketIdCache();
+        MarkPacketSeen(packet.Id);
         var tasks = _connections.Values.Select(c => SendPacketToClientAsync(c, packet));
         await Task.WhenAll(tasks);
     }
@@ -248,8 +248,7 @@ public class WiFiService : IDisposable
     {
         packet.SenderId = LocalId;
         packet.SenderName = LocalName;
-        _seenPacketIds[packet.Id] = string.Empty;
-        CleanupPacketIdCache();
+        MarkPacketSeen(packet.Id);
         if (_connections.TryGetValue(peerId, out var client))
             await SendPacketToClientAsync(client, packet);
     }

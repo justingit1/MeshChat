@@ -21,7 +21,8 @@ public class BluetoothService : IDisposable
     private CancellationTokenSource _cts = new();
 
     private readonly ConcurrentDictionary<string, BluetoothClient> _connections = new();
-    private readonly ConcurrentDictionary<string, string> _seenPacketIds = new();
+    private readonly ConcurrentDictionary<string, byte> _seenPacketIds = new();
+    private readonly ConcurrentQueue<string> _seenPacketOrder = new();
 
     public string LocalName { get; set; } = Environment.MachineName;
     public string LocalId { get; set; } = string.Empty;
@@ -183,9 +184,7 @@ public class BluetoothService : IDisposable
                     });
                 }
 
-                if (_seenPacketIds.ContainsKey(packet.Id)) continue;
-                _seenPacketIds[packet.Id] = string.Empty;
-                CleanupPacketIdCache();
+                if (!MarkPacketSeen(packet.Id)) continue;
 
                 // Relay if needed
                 if (packet.Ttl > 1 && packet.TargetId != LocalId && packet.TargetId != null)
@@ -223,24 +222,26 @@ public class BluetoothService : IDisposable
         await Task.WhenAll(tasks);
     }
 
-    private void CleanupPacketIdCache()
+    private bool MarkPacketSeen(string packetId)
     {
-        if (_seenPacketIds.Count > MaxPacketIdCacheSize)
+        if (!_seenPacketIds.TryAdd(packetId, 0))
+            return false;
+
+        _seenPacketOrder.Enqueue(packetId);
+        while (_seenPacketIds.Count > MaxPacketIdCacheSize &&
+               _seenPacketOrder.TryDequeue(out var oldPacketId))
         {
-            var keysToRemove = _seenPacketIds.Keys.Take(_seenPacketIds.Count / 2).ToList();
-            foreach (var key in keysToRemove)
-            {
-                _seenPacketIds.TryRemove(key, out _);
-            }
+            _seenPacketIds.TryRemove(oldPacketId, out _);
         }
+
+        return true;
     }
 
     public async Task SendToAllAsync(NetworkPacket packet)
     {
         packet.SenderId = LocalId;
         packet.SenderName = LocalName;
-        _seenPacketIds[packet.Id] = string.Empty;
-        CleanupPacketIdCache();
+        MarkPacketSeen(packet.Id);
 
         var tasks = _connections.Values.Select(c => SendPacketToClientAsync(c, packet));
         await Task.WhenAll(tasks);
@@ -250,8 +251,7 @@ public class BluetoothService : IDisposable
     {
         packet.SenderId = LocalId;
         packet.SenderName = LocalName;
-        _seenPacketIds[packet.Id] = string.Empty;
-        CleanupPacketIdCache();
+        MarkPacketSeen(packet.Id);
 
         if (_connections.TryGetValue(peerId, out var client))
             await SendPacketToClientAsync(client, packet);

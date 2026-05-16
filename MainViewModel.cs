@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Linq;
 using System.Media;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
@@ -106,11 +107,11 @@ public partial class MainViewModel : INotifyPropertyChanged
             if (string.IsNullOrWhiteSpace(SearchQuery))
                 return Messages;
 
-            var query = SearchQuery.ToLowerInvariant();
+            var query = SearchQuery.Trim();
             return Messages.Where(m =>
-                m.Content.ToLowerInvariant().Contains(query) ||
-                (m.SenderName?.ToLowerInvariant().Contains(query) ?? false) ||
-                (m.FileName?.ToLowerInvariant().Contains(query) ?? false));
+                m.Content.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                (m.SenderName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false) ||
+                (m.FileName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false));
         }
     }
 
@@ -140,7 +141,9 @@ public partial class MainViewModel : INotifyPropertyChanged
             {
                 "WiFi" => l.Tag.StartsWith("WiFi"),
                 "Bluetooth" => l.Tag.StartsWith("Bluetooth"),
-                "Errors" => l.Tag.Contains("Error") || l.Message.Contains("Error") || l.Message.Contains("failed"),
+                "Errors" => l.Tag.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                            l.Message.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                            l.Message.Contains("failed", StringComparison.OrdinalIgnoreCase),
                 "Messages" => l.Tag.Contains("SENT") || l.Tag.Contains("RECEIVED"),
                 _ => true
             });
@@ -302,13 +305,19 @@ public partial class MainViewModel : INotifyPropertyChanged
 
     // Per-peer message history
     private readonly Dictionary<string, List<ChatMessage>> _messageHistory = [];
+    private readonly Dictionary<string, Peer> _peerById = [];
+    private readonly Dictionary<string, ChatMessage> _messageById = [];
+    private readonly Dictionary<string, Dictionary<string, HashSet<string>>> _reactionUsersByMessage = [];
+    private readonly SemaphoreSlim _saveLock = new(1, 1);
+    private int _saveVersion;
+    private const int SaveDebounceMs = 500;
+    private const int MaxVisibleHistoryMessages = 500;
 
     // ─── Transport Routing Helpers ──────────────────────────────────────────
 
     private async Task SendToPeerViaTransportAsync(string peerId, NetworkPacket packet)
     {
-        var peer = Peers.FirstOrDefault(p => p.Id == peerId);
-        if (peer == null)
+        if (!_peerById.TryGetValue(peerId, out var peer))
         {
             // Default to WiFi if peer not found
             await _wifi.SendToPeerAsync(peerId, packet);
@@ -528,9 +537,9 @@ public partial class MainViewModel : INotifyPropertyChanged
             // Deduplicate by ID — also guard against discovering ourselves
             if (peer.Id == _wifi.LocalId) return;
 
-            var existing = Peers.FirstOrDefault(p => p.Id == peer.Id);
-            if (existing == null)
+            if (!_peerById.TryGetValue(peer.Id, out var existing))
             {
+                _peerById[peer.Id] = peer;
                 Peers.Add(peer);
                 AddLog($"Peer joined: {peer.DisplayName} via {peer.Transport} ({peer.HopDescription})");
 
@@ -556,8 +565,7 @@ public partial class MainViewModel : INotifyPropertyChanged
     {
         _dispatcher.Invoke(() =>
         {
-            var peer = Peers.FirstOrDefault(p => p.Id == peerId);
-            if (peer != null)
+            if (_peerById.TryGetValue(peerId, out var peer))
             {
                 peer.Status = PeerStatus.Offline;
                 AddLog($"Peer left: {peer.DisplayName}");
@@ -654,8 +662,7 @@ public partial class MainViewModel : INotifyPropertyChanged
         else
         {
             // Viewing a different peer — increment unread badge
-            var peer = Peers.FirstOrDefault(p => p.Id == peerId);
-            if (peer != null) peer.UnreadCount++;
+            if (_peerById.TryGetValue(peerId, out var peer)) peer.UnreadCount++;
         }
 
         // Send delivery receipt
@@ -677,44 +684,28 @@ public partial class MainViewModel : INotifyPropertyChanged
     private void HandleDeliveryAck(NetworkPacket packet)
     {
         var msgId = packet.Payload;
-        var msg = Messages.FirstOrDefault(m => m.Id == msgId);
-        if (msg != null) msg.Status = MessageStatus.Delivered;
+        if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
+            msg.Status = MessageStatus.Delivered;
     }
 
     private void HandleReadReceipt(NetworkPacket packet)
     {
         var msgId = packet.Payload;
-        var msg = Messages.FirstOrDefault(m => m.Id == msgId);
-        if (msg != null) msg.Status = MessageStatus.Read;
+        if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
+            msg.Status = MessageStatus.Read;
     }
 
     public async Task AddReactionAsync(string messageId, string emoji)
     {
         // Find the message
-        var msg = Messages.FirstOrDefault(m => m.Id == messageId);
-        if (msg == null) return;
+        if (!_messageById.TryGetValue(messageId, out var msg)) return;
 
         // Initialize reactions dict if null
         if (msg.Reactions == null)
             msg.Reactions = new Dictionary<string, List<string>>();
 
         // Toggle reaction: add if not present, remove if present
-        bool isAdding = true;
-        if (msg.Reactions.ContainsKey(emoji) && msg.Reactions[emoji].Contains(_wifi.LocalId))
-        {
-            // User already reacted with this emoji - remove it
-            msg.Reactions[emoji].Remove(_wifi.LocalId);
-            if (msg.Reactions[emoji].Count == 0)
-                msg.Reactions.Remove(emoji);
-            isAdding = false;
-        }
-        else
-        {
-            // Add the reaction
-            if (!msg.Reactions.ContainsKey(emoji))
-                msg.Reactions[emoji] = new List<string>();
-            msg.Reactions[emoji].Add(_wifi.LocalId);
-        }
+        bool isAdding = ToggleReaction(msg, emoji, _wifi.LocalId);
 
         // Notify property changed to update UI
         OnPropertyChanged(nameof(Messages));
@@ -761,17 +752,7 @@ public partial class MainViewModel : INotifyPropertyChanged
             var reaction = JsonConvert.DeserializeObject<ReactionPayload>(packet.Payload);
             if (reaction == null) return;
 
-            // Find the message in history
-            ChatMessage? msg = null;
-
-            // Search through all message histories
-            foreach (var history in _messageHistory.Values)
-            {
-                msg = history.FirstOrDefault(m => m.Id == reaction.MessageId);
-                if (msg != null) break;
-            }
-
-            if (msg == null) return;
+            if (!_messageById.TryGetValue(reaction.MessageId, out var msg)) return;
 
             // Initialize reactions dict if null
             if (msg.Reactions == null)
@@ -779,21 +760,11 @@ public partial class MainViewModel : INotifyPropertyChanged
 
             if (reaction.IsAdded)
             {
-                // Add the reaction
-                if (!msg.Reactions.ContainsKey(reaction.Emoji))
-                    msg.Reactions[reaction.Emoji] = new List<string>();
-                if (!msg.Reactions[reaction.Emoji].Contains(reaction.UserId))
-                    msg.Reactions[reaction.Emoji].Add(reaction.UserId);
+                AddReactionUser(msg, reaction.Emoji, reaction.UserId);
             }
             else
             {
-                // Remove the reaction
-                if (msg.Reactions.ContainsKey(reaction.Emoji))
-                {
-                    msg.Reactions[reaction.Emoji].Remove(reaction.UserId);
-                    if (msg.Reactions[reaction.Emoji].Count == 0)
-                        msg.Reactions.Remove(reaction.Emoji);
-                }
+                RemoveReactionUser(msg, reaction.Emoji, reaction.UserId);
             }
 
             // Notify property changed
@@ -813,8 +784,7 @@ public partial class MainViewModel : INotifyPropertyChanged
     {
         _dispatcher.Invoke(() =>
         {
-            var msg = Messages.FirstOrDefault(m => m.Id == msgId);
-            if (msg != null) msg.FileProgress = progress;
+            if (_messageById.TryGetValue(msgId, out var msg)) msg.FileProgress = progress;
         });
     }
 
@@ -822,8 +792,7 @@ public partial class MainViewModel : INotifyPropertyChanged
     {
         _dispatcher.Invoke(() =>
         {
-            var msg = Messages.FirstOrDefault(m => m.Id == msgId);
-            if (msg != null)
+            if (_messageById.TryGetValue(msgId, out var msg))
             {
                 msg.FilePath = savedPath;
                 msg.Status = MessageStatus.Delivered;
@@ -837,9 +806,10 @@ public partial class MainViewModel : INotifyPropertyChanged
 
     private void AddMessageToHistory(string peerId, ChatMessage msg)
     {
-        if (!_messageHistory.ContainsKey(peerId))
-            _messageHistory[peerId] = [];
-        _messageHistory[peerId].Add(msg);
+        if (!_messageHistory.TryGetValue(peerId, out var history))
+            _messageHistory[peerId] = history = [];
+        history.Add(msg);
+        IndexMessage(msg);
         SaveMessagesAsync();
     }
 
@@ -852,9 +822,10 @@ public partial class MainViewModel : INotifyPropertyChanged
             {
                 // For simplicity, store all messages under "broadcast" key
                 // A more sophisticated approach would track recipient per message
-                if (!_messageHistory.ContainsKey("broadcast"))
-                    _messageHistory["broadcast"] = [];
-                _messageHistory["broadcast"].Add(msg);
+                if (!_messageHistory.TryGetValue("broadcast", out var broadcast))
+                    _messageHistory["broadcast"] = broadcast = [];
+                broadcast.Add(msg);
+                IndexMessage(msg);
             }
             Logger.Info($"Loaded {messages.Count} persisted messages");
         }
@@ -868,12 +839,106 @@ public partial class MainViewModel : INotifyPropertyChanged
     {
         try
         {
+            var saveVersion = Interlocked.Increment(ref _saveVersion);
+            await Task.Delay(SaveDebounceMs);
+
+            if (saveVersion != Volatile.Read(ref _saveVersion))
+                return;
+
             var allMessages = _messageHistory.Values.SelectMany(m => m).ToList();
-            await Task.Run(() => _messageStore.Save(allMessages));
+
+            await _saveLock.WaitAsync();
+            try
+            {
+                await Task.Run(() => _messageStore.Save(allMessages));
+            }
+            finally
+            {
+                _saveLock.Release();
+            }
         }
         catch (Exception ex)
         {
             Logger.Error("Failed to save messages", ex);
+        }
+    }
+
+    private void IndexMessage(ChatMessage msg)
+    {
+        if (!string.IsNullOrWhiteSpace(msg.Id))
+        {
+            _messageById[msg.Id] = msg;
+            IndexReactions(msg);
+        }
+    }
+
+    private void IndexReactions(ChatMessage msg)
+    {
+        var indexed = new Dictionary<string, HashSet<string>>();
+        if (msg.Reactions != null)
+        {
+            foreach (var reaction in msg.Reactions)
+                indexed[reaction.Key] = new HashSet<string>(reaction.Value);
+        }
+        _reactionUsersByMessage[msg.Id] = indexed;
+    }
+
+    private Dictionary<string, HashSet<string>> GetReactionIndex(ChatMessage msg)
+    {
+        if (!_reactionUsersByMessage.TryGetValue(msg.Id, out var reactions))
+        {
+            IndexReactions(msg);
+            reactions = _reactionUsersByMessage[msg.Id];
+        }
+
+        return reactions;
+    }
+
+    private bool ToggleReaction(ChatMessage msg, string emoji, string userId)
+    {
+        var reactions = GetReactionIndex(msg);
+        if (reactions.TryGetValue(emoji, out var users) && users.Contains(userId))
+        {
+            RemoveReactionUser(msg, emoji, userId);
+            return false;
+        }
+
+        AddReactionUser(msg, emoji, userId);
+        return true;
+    }
+
+    private void AddReactionUser(ChatMessage msg, string emoji, string userId)
+    {
+        msg.Reactions ??= new Dictionary<string, List<string>>();
+        var reactions = GetReactionIndex(msg);
+
+        if (!reactions.TryGetValue(emoji, out var users))
+            reactions[emoji] = users = [];
+
+        if (users.Add(userId))
+        {
+            if (!msg.Reactions.TryGetValue(emoji, out var visibleUsers))
+                msg.Reactions[emoji] = visibleUsers = [];
+            visibleUsers.Add(userId);
+        }
+    }
+
+    private void RemoveReactionUser(ChatMessage msg, string emoji, string userId)
+    {
+        msg.Reactions ??= new Dictionary<string, List<string>>();
+        var reactions = GetReactionIndex(msg);
+
+        if (!reactions.TryGetValue(emoji, out var users) || !users.Remove(userId))
+            return;
+
+        if (users.Count == 0)
+            reactions.Remove(emoji);
+
+        if (msg.Reactions.TryGetValue(emoji, out var visibleUsers))
+        {
+            visibleUsers.Remove(userId);
+            if (visibleUsers.Count == 0)
+                msg.Reactions.Remove(emoji);
         }
     }
 
@@ -900,8 +965,11 @@ public partial class MainViewModel : INotifyPropertyChanged
     private void LoadMessagesWithDateSeparators(List<ChatMessage> history)
     {
         DateTime? lastDate = null;
+        var visibleHistory = history.Count > MaxVisibleHistoryMessages
+            ? history.Skip(history.Count - MaxVisibleHistoryMessages)
+            : history;
 
-        foreach (var msg in history)
+        foreach (var msg in visibleHistory)
         {
             // Add date separator if date changed
             if (msg.Type != MessageType.System && msg.Type != MessageType.DateSeparator)

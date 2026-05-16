@@ -1,0 +1,25 @@
+# Build results
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+packages/
+
+# Rider
+.idea/
+
+# Local credentials and machine-specific assistant settings
+.env
+.env.*
+!.env.example
+.claude/*.local.json
+.claude/settings/.local.json
+.claude/**/*.local.json
