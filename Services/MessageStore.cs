@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using MeshChat.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 
 namespace MeshChat.Services;
@@ -11,9 +13,11 @@ public class MessageStore
 {
     private readonly string _filePath;
     private readonly object _lock = new();
+    private readonly ILogger<MessageStore> _logger;
 
-    public MessageStore()
+    public MessageStore(ILogger<MessageStore>? logger = null)
     {
+        _logger = logger ?? NullLogger<MessageStore>.Instance;
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var dataDir = Path.Combine(appData, "MeshChat", "Data");
         Directory.CreateDirectory(dataDir);
@@ -34,7 +38,7 @@ public class MessageStore
             }
             catch (Exception ex)
             {
-                Logger.Error("Failed to load messages", ex);
+                _logger.LogError(ex, "Failed to load messages from {FilePath}", _filePath);
             }
             return new List<ChatMessage>();
         }
@@ -51,7 +55,7 @@ public class MessageStore
             }
             catch (Exception ex)
             {
-                Logger.Error("Failed to save messages", ex);
+                _logger.LogError(ex, "Failed to save messages to {FilePath}", _filePath);
             }
         }
     }
@@ -67,7 +71,7 @@ public class MessageStore
             }
             catch (Exception ex)
             {
-                Logger.Error("Failed to clear messages", ex);
+                _logger.LogError(ex, "Failed to clear messages at {FilePath}", _filePath);
             }
         }
     }

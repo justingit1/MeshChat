@@ -3,12 +3,14 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Collections.Specialized;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 using MeshChat.ViewModels;
 using MeshChat.Models;
 using System.Windows.Media.Animation;
-using MeshChat;
+using MeshChat.Services;
+using Microsoft.Extensions.Logging;
 
 namespace MeshChat.Views;
 
@@ -56,16 +58,25 @@ public class GridLengthAnimation : AnimationTimeline
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _vm;
+    private readonly ILogger<MainWindow> _logger;
+    private readonly CancellationTokenSource _windowCts = new();
     private const double NetworkLogExpandedWidth = 280;
     private const double NetworkLogCollapsedWidth = 0;
 
-    public MainWindow()
+    public MainWindow(ILoggerFactory loggerFactory)
     {
         InitializeComponent();
+        _logger = loggerFactory.CreateLogger<MainWindow>();
 
-        // Create ViewModel async to avoid blocking UI during startup
-        // This prevents the window from appearing frozen with loading cursor
-        _vm = new MainViewModel();
+        // Create typed loggers from the application factory and pass them into
+        // each component that owns work. Use ILogger<T> placeholders for values
+        // so the file provider receives structured properties.
+        _vm = new MainViewModel(
+            new WiFiService(loggerFactory.CreateLogger<WiFiService>()),
+            new BluetoothService(loggerFactory.CreateLogger<BluetoothService>()),
+            new FileTransferService(loggerFactory.CreateLogger<FileTransferService>()),
+            new MessageStore(loggerFactory.CreateLogger<MessageStore>()),
+            loggerFactory.CreateLogger<MainViewModel>());
         DataContext = _vm;
 
         // Auto-scroll the virtualized message list without forcing every item container to be created.
@@ -90,38 +101,55 @@ public partial class MainWindow : Window
             NetworkLogPanel.Width = NetworkLogExpandedWidth;
 
             // Play smooth modern animations on load
-            PlayStartupAnimations();
+            _ = PlayStartupAnimationsAsync(_windowCts.Token);
 
-            // Start services after window is fully rendered.
-            await _vm.StartAsync();
-            UpdateTitle();
+            try
+            {
+                // Start services after window is fully rendered.
+                await _vm.StartAsync(_windowCts.Token);
+                UpdateTitle();
+            }
+            catch (OperationCanceledException) when (_windowCts.IsCancellationRequested)
+            {
+            }
         };
-        Closing += (_, _) => _vm.Stop();
+        Closing += (_, _) =>
+        {
+            _windowCts.Cancel();
+            _vm.Stop();
+            _windowCts.Dispose();
+        };
     }
 
-    private async void PlayStartupAnimations()
+    private async Task PlayStartupAnimationsAsync(CancellationToken cancellationToken)
     {
-        // Small delay to ensure window is ready
-        await Task.Delay(50);
+        try
+        {
+            // Delays are tokenized so startup animations stop cleanly if the window closes mid-sequence.
+            await Task.Delay(50, cancellationToken);
 
-        // Fade in the entire window
-        var windowFadeIn = (Storyboard)Resources["WindowFadeIn"];
-        windowFadeIn.Begin(this);
+            // Fade in the entire window
+            var windowFadeIn = (Storyboard)Resources["WindowFadeIn"];
+            windowFadeIn.Begin(this);
 
-        // Slide down the header
-        await Task.Delay(100);
-        var headerStoryboard = (Storyboard)Resources["HeaderSlideIn"];
-        headerStoryboard.Begin(HeaderBorder);
+            // Slide down the header
+            await Task.Delay(100, cancellationToken);
+            var headerStoryboard = (Storyboard)Resources["HeaderSlideIn"];
+            headerStoryboard.Begin(HeaderBorder);
 
-        // Slide in the sidebar
-        await Task.Delay(120);
-        var sidebarStoryboard = (Storyboard)Resources["SidebarSlideIn"];
-        sidebarStoryboard.Begin(SidebarBorder);
+            // Slide in the sidebar
+            await Task.Delay(120, cancellationToken);
+            var sidebarStoryboard = (Storyboard)Resources["SidebarSlideIn"];
+            sidebarStoryboard.Begin(SidebarBorder);
 
-        // Fade in the chat area
-        await Task.Delay(150);
-        var chatStoryboard = (Storyboard)Resources["ChatAreaFadeIn"];
-        chatStoryboard.Begin(MainContentGrid);
+            // Fade in the chat area
+            await Task.Delay(150, cancellationToken);
+            var chatStoryboard = (Storyboard)Resources["ChatAreaFadeIn"];
+            chatStoryboard.Begin(MainContentGrid);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     private void AnimateNetworkLog(bool show)
@@ -166,18 +194,18 @@ public partial class MainWindow : Window
 
     private void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        if (e.Action == NotifyCollectionChangedAction.Add)
+        if (e.Action is NotifyCollectionChangedAction.Add or NotifyCollectionChangedAction.Reset)
         {
             Dispatcher.InvokeAsync(() =>
             {
-                if (_vm.FilteredMessages.LastOrDefault() is ChatMessage lastMessage)
+                if (_vm.FilteredMessages.Cast<ChatMessage>().LastOrDefault() is ChatMessage lastMessage)
                     MessagesList.ScrollIntoView(lastMessage);
             }, System.Windows.Threading.DispatcherPriority.Loaded);
         }
     }
 
     private async void SendButton_Click(object sender, RoutedEventArgs e)
-        => await _vm.SendMessageAsync();
+        => await _vm.SendMessageAsync(_windowCts.Token);
 
     private void MessageInput_KeyDown(object sender, KeyEventArgs e)
     {
@@ -185,12 +213,12 @@ public partial class MainWindow : Window
         if (e.Key == Key.Return && (Keyboard.Modifiers == ModifierKeys.Control || !Keyboard.IsKeyDown(Key.LeftShift)))
         {
             e.Handled = true;
-            _ = _vm.SendMessageAsync();
+            _ = _vm.SendMessageAsync(_windowCts.Token);
         }
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
-        => await _vm.ConnectManualAsync();
+        => await _vm.ConnectManualAsync(_windowCts.Token);
 
     private void AddDeviceButton_Click(object sender, RoutedEventArgs e)
     {
@@ -230,7 +258,7 @@ public partial class MainWindow : Window
         };
 
         if (dialog.ShowDialog() == true)
-            await _vm.SendFileAsync(dialog.FileName);
+            await _vm.SendFileAsync(dialog.FileName, _windowCts.Token);
     }
 
     private void UpdateTitle()
@@ -289,7 +317,7 @@ public partial class MainWindow : Window
                 {
                     System.Windows.Clipboard.SetText(msg.Content);
                 }
-                catch (Exception ex) { Logger.Error("Clipboard error", ex); }
+                catch (Exception ex) { _logger.LogError(ex, "Clipboard error while copying message content"); }
             }
         }
     }
@@ -305,7 +333,7 @@ public partial class MainWindow : Window
                 {
                     System.Windows.Clipboard.SetText(msg.SenderName ?? "");
                 }
-                catch (Exception ex) { Logger.Error("Clipboard error", ex); }
+                catch (Exception ex) { _logger.LogError(ex, "Clipboard error while copying sender name"); }
             }
         }
     }

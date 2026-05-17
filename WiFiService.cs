@@ -10,16 +10,44 @@ using System.Threading;
 using System.Threading.Tasks;
 using MeshChat.Models;
 using Makaretu.Dns;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 
 namespace MeshChat.Services;
 
-public class WiFiService : IDisposable
+public interface INetworkService : IDisposable
+{
+    string LocalId { get; set; }
+    string LocalName { get; set; }
+    int ListenPort { get; }
+    bool IsAvailable { get; }
+    bool IsRunning { get; }
+
+    // Transport implementations raise these events so callers can share one
+    // receive/discovery pipeline without knowing whether packets came over WiFi or Bluetooth.
+    event Action<Peer>? PeerDiscovered;
+    event Action<string>? PeerLost;
+    event Action<NetworkPacket>? PacketReceived;
+    event Action<string>? LogMessage;
+
+    // Send/connect methods accept cancellation tokens for UI shutdown and future
+    // operations that need to cancel pending network work through the interface.
+    Task StartAsync(CancellationToken cancellationToken = default);
+    void Stop();
+    Task SendToAllAsync(NetworkPacket packet, CancellationToken cancellationToken = default);
+    Task SendToPeerAsync(string peerId, NetworkPacket packet, CancellationToken cancellationToken = default);
+    Task ConnectToPeerAsync(string address, int? port = null, CancellationToken cancellationToken = default);
+}
+
+public class WiFiService : INetworkService
 {
     private const int DefaultPort = 45678;
     private const string ServiceType = "_meshchat._tcp";
+    private const string TransportName = "WiFi";
     private const int MaxPacketIdCacheSize = 10000; // Prevent unbounded growth
 
+    private readonly ILogger<WiFiService> _logger;
     private TcpListener? _listener;
     private MulticastService? _multicast;
     private ServiceDiscovery? _serviceDiscovery;
@@ -28,9 +56,10 @@ public class WiFiService : IDisposable
     private readonly ConcurrentQueue<string> _seenPacketOrder = new();
     private CancellationTokenSource _cts = new();
 
-    public string LocalId { get; private set; } = Guid.NewGuid().ToString();
+    public string LocalId { get; set; } = Guid.NewGuid().ToString();
     public string LocalName { get; set; } = Environment.MachineName;
     public int ListenPort { get; private set; } = DefaultPort;
+    public bool IsAvailable => IsRunning;
     public bool IsRunning { get; private set; }
 
     public event Action<Peer>? PeerDiscovered;
@@ -38,21 +67,26 @@ public class WiFiService : IDisposable
     public event Action<NetworkPacket>? PacketReceived;
     public event Action<string>? LogMessage;
 
-    public async Task StartAsync()
+    public WiFiService(ILogger<WiFiService>? logger = null)
     {
-        _cts = new CancellationTokenSource();
+        _logger = logger ?? NullLogger<WiFiService>.Instance;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         // Find port in background to avoid blocking UI
-        ListenPort = await Task.Run(() => FindAvailablePort(DefaultPort));
+        ListenPort = await Task.Run(() => FindAvailablePort(DefaultPort), cancellationToken);
 
         _listener = new TcpListener(IPAddress.Any, ListenPort);
         _listener.Start();
         IsRunning = true;
-        Log($"TCP server listening on port {ListenPort}");
+        Log("TCP server listening on port {ListenPort}", ListenPort);
         _ = AcceptConnectionsAsync(_cts.Token);
 
         // Run mDNS in background to avoid blocking UI
-        _ = Task.Run(StartMdns);
+        _ = Task.Run(() => StartMdns(_cts.Token), _cts.Token);
     }
 
     public void Stop()
@@ -66,10 +100,11 @@ public class WiFiService : IDisposable
         IsRunning = false;
     }
 
-    private void StartMdns()
+    private void StartMdns(CancellationToken cancellationToken)
     {
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             _multicast = new MulticastService();
             _serviceDiscovery = new ServiceDiscovery(_multicast);
             var profile = new ServiceProfile(
@@ -83,7 +118,7 @@ public class WiFiService : IDisposable
             _multicast.Start();
             _serviceDiscovery.QueryAllServices();
         }
-        catch (Exception ex) { Log($"mDNS warning: {ex.Message}"); }
+        catch (Exception ex) { LogWarning(ex, "mDNS warning: {Message}", ex.Message); }
     }
 
     private void OnServiceDiscovered(object? sender, ServiceInstanceDiscoveryEventArgs e)
@@ -102,7 +137,7 @@ public class WiFiService : IDisposable
                 _ = HandleClientAsync(client, ct);
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Error("WiFi listener error", ex); }
+            catch (Exception ex) { _logger.LogError(ex, "WiFi listener error"); }
         }
     }
 
@@ -125,7 +160,7 @@ public class WiFiService : IDisposable
                     peerId = packet.SenderId;
                     _connections[peerId] = client;
                     var ep = (IPEndPoint)client.Client.RemoteEndPoint!;
-                    Log($"Incoming connection from {packet.SenderName} ({ep.Address})");
+                    Log("Incoming connection from {SenderName} ({RemoteAddress})", packet.SenderName, ep.Address);
                     PeerDiscovered?.Invoke(new Peer
                     {
                         Id = packet.SenderId,
@@ -136,7 +171,7 @@ public class WiFiService : IDisposable
                         TcpPort = packet.TcpPort,
                         HopsAway = 1
                     });
-                    await SendHelloAckAsync(client, packet.SenderId);
+                    await SendHelloAckAsync(client, packet.SenderId, ct);
                 }
 
                 // When the remote peer acknowledges our Hello, register the connection
@@ -146,7 +181,7 @@ public class WiFiService : IDisposable
                     peerId = packet.SenderId;
                     _connections[peerId] = client;
                     var ep = (IPEndPoint)client.Client.RemoteEndPoint!;
-                    Log($"Connection established with {packet.SenderName}");
+                    Log("Connection established with {SenderName}", packet.SenderName);
                     PeerDiscovered?.Invoke(new Peer
                     {
                         Id = packet.SenderId,
@@ -168,14 +203,14 @@ public class WiFiService : IDisposable
                     var visited = new System.Collections.Generic.List<string>(packet.VisitedNodes);
                     visited.Add(LocalId);
                     packet.VisitedNodes = visited.ToArray();
-                    await RelayPacketAsync(packet);
+                    await RelayPacketAsync(packet, ct);
                 }
 
                 PacketReceived?.Invoke(packet);
             }
         }
         catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Error("WiFi listener error", ex); }
+            catch (Exception ex) { _logger.LogError(ex, "WiFi listener error"); }
         finally
         {
             if (peerId != null) { _connections.TryRemove(peerId, out _); PeerLost?.Invoke(peerId); }
@@ -183,11 +218,11 @@ public class WiFiService : IDisposable
         }
     }
 
-    private async Task RelayPacketAsync(NetworkPacket packet)
+    private async Task RelayPacketAsync(NetworkPacket packet, CancellationToken cancellationToken)
     {
         var tasks = _connections
             .Where(kvp => !packet.VisitedNodes.Contains(kvp.Key))
-            .Select(kvp => SendPacketToClientAsync(kvp.Value, packet));
+            .Select(kvp => SendPacketToClientAsync(kvp.Value, packet, cancellationToken));
         await Task.WhenAll(tasks);
     }
 
@@ -206,27 +241,27 @@ public class WiFiService : IDisposable
         return true;
     }
 
-    public async Task SendToAllAsync(NetworkPacket packet)
+    public async Task SendToAllAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         packet.SenderId = LocalId;
         packet.SenderName = LocalName;
         MarkPacketSeen(packet.Id);
-        var tasks = _connections.Values.Select(c => SendPacketToClientAsync(c, packet));
+        var tasks = _connections.Values.Select(c => SendPacketToClientAsync(c, packet, cancellationToken));
         await Task.WhenAll(tasks);
     }
 
-    private async Task SendPacketToClientAsync(TcpClient client, NetworkPacket packet)
+    private async Task SendPacketToClientAsync(TcpClient client, NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         try
         {
             var json = JsonConvert.SerializeObject(packet) + "\n";
-            await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(json));
+            await client.GetStream().WriteAsync(Encoding.UTF8.GetBytes(json), cancellationToken);
         }
         catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Error("WiFi listener error", ex); }
+            catch (Exception ex) { _logger.LogError(ex, "WiFi send error"); }
     }
 
-    private async Task SendHelloAckAsync(TcpClient client, string targetId)
+    private async Task SendHelloAckAsync(TcpClient client, string targetId, CancellationToken cancellationToken)
     {
         await SendPacketToClientAsync(client, new NetworkPacket
         {
@@ -235,31 +270,39 @@ public class WiFiService : IDisposable
             SenderName = LocalName,
             TcpPort = ListenPort,
             TargetId = targetId
-        });
+        }, cancellationToken);
     }
 
-    private static int FindAvailablePort(int preferred)
+    private int FindAvailablePort(int preferred)
     {
         try { var l = new TcpListener(IPAddress.Any, preferred); l.Start(); l.Stop(); return preferred; }
-        catch { Logger.Warning($"Port {preferred} in use, trying {preferred + 1}"); return preferred + 1; }
+        catch
+        {
+            _logger.LogWarning(
+                "Port {PreferredPort} in use, trying {FallbackPort}",
+                preferred,
+                preferred + 1);
+            return preferred + 1;
+        }
     }
 
-    public async Task SendToPeerAsync(string peerId, NetworkPacket packet)
+    public async Task SendToPeerAsync(string peerId, NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         packet.SenderId = LocalId;
         packet.SenderName = LocalName;
         MarkPacketSeen(packet.Id);
         if (_connections.TryGetValue(peerId, out var client))
-            await SendPacketToClientAsync(client, packet);
+            await SendPacketToClientAsync(client, packet, cancellationToken);
     }
 
-    public async Task ConnectToPeerAsync(string ipAddress, int port)
+    public async Task ConnectToPeerAsync(string address, int? port = null, CancellationToken cancellationToken = default)
     {
         try
         {
             var client = new TcpClient();
-            await client.ConnectAsync(ipAddress, port);
-            Log($"Connected to {ipAddress}:{port}");
+            var tcpPort = port ?? DefaultPort;
+            await client.ConnectAsync(address, tcpPort, cancellationToken);
+            Log("Connected to {Address}:{Port}", address, tcpPort);
             _ = HandleClientAsync(client, _cts.Token);
 
             // Send Hello so the remote peer registers us
@@ -270,11 +313,46 @@ public class WiFiService : IDisposable
                 SenderName = LocalName,
                 TcpPort = ListenPort
             };
-            await SendPacketToClientAsync(client, hello);
+            await SendPacketToClientAsync(client, hello, cancellationToken);
         }
-        catch (Exception ex) { Log($"Connect failed: {ex.Message}"); }
+        catch (Exception ex) { LogWarning(ex, "Connect failed: {Message}", ex.Message); }
     }
 
-    private void Log(string msg) => LogMessage?.Invoke($"[WiFi] {msg}");
+    private void Log(string message, params object?[] args)
+    {
+        _logger.LogInformation(message, args);
+        LogMessage?.Invoke($"[{TransportName}] {FormatLogMessage(message, args)}");
+    }
+
+    private void LogWarning(Exception exception, string message, params object?[] args)
+    {
+        _logger.LogWarning(exception, message, args);
+        LogMessage?.Invoke($"[{TransportName}] {FormatLogMessage(message, args)}");
+    }
+
+    private static string FormatLogMessage(string template, object?[] args)
+    {
+        var result = new StringBuilder();
+        var argIndex = 0;
+
+        for (var i = 0; i < template.Length; i++)
+        {
+            if (template[i] == '{')
+            {
+                var end = template.IndexOf('}', i + 1);
+                if (end > i)
+                {
+                    result.Append(argIndex < args.Length ? args[argIndex++] : template[i..(end + 1)]);
+                    i = end;
+                    continue;
+                }
+            }
+
+            result.Append(template[i]);
+        }
+
+        return result.ToString();
+    }
+
     public void Dispose() => Stop();
 }

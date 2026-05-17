@@ -235,7 +235,10 @@
                         <ListBox Grid.Row="1"
                                  ItemsSource="{Binding Peers}"
                                  SelectedItem="{Binding SelectedPeer}"
-                                 AutomationProperties.Name="Network peers">
+                                 AutomationProperties.Name="Network peers"
+                                 ScrollViewer.CanContentScroll="True"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling">
                             <ListBox.ItemTemplate>
                                 <DataTemplate DataType="{x:Type models:Peer}">
                                     <Grid>
@@ -408,7 +411,10 @@
                              Background="{StaticResource AppBackgroundBrush}"
                              Padding="{StaticResource MessageListPadding}"
                              ItemsSource="{Binding FilteredMessages}"
-                             ItemContainerStyle="{StaticResource MessageListItemStyle}">
+                             ItemContainerStyle="{StaticResource MessageListItemStyle}"
+                             ScrollViewer.CanContentScroll="True"
+                             VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Recycling">
                         <ListBox.ItemsPanel>
                             <ItemsPanelTemplate>
                                 <VirtualizingStackPanel/>
@@ -656,7 +662,10 @@
                         <ListBox Grid.Row="1"
                                  ItemsSource="{Binding FilteredLogs}"
                                  ItemContainerStyle="{StaticResource LogListItemStyle}"
-                                 Padding="12">
+                                 Padding="12"
+                                 ScrollViewer.CanContentScroll="True"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling">
                             <ListBox.ItemsPanel>
                                 <ItemsPanelTemplate>
                                     <VirtualizingStackPanel/>

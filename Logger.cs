@@ -1,41 +1,126 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
-using MeshChat.Models;
+using System.Linq;
+using System.Text;
+using Microsoft.Extensions.Logging;
 
-namespace MeshChat;
+namespace MeshChat.Logging;
 
-public static class Logger
+// MeshChat uses the Microsoft.Extensions.Logging abstractions throughout the app.
+// App.xaml.cs creates one ILoggerFactory, registers this provider, and injects typed
+// ILogger<T> instances into view models and services. Keep UI log coloring in
+// MainViewModel/LogEntryToInlinesConverter; this provider is only the durable file sink.
+public sealed class DailyFileLoggerProvider : ILoggerProvider
 {
-    private static readonly string LogFilePath;
-    private static readonly object LockObj = new();
+    private readonly string _logDirectory;
+    private readonly object _writeLock = new();
+    private bool _disposed;
 
-    static Logger()
+    public DailyFileLoggerProvider()
     {
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var logDir = Path.Combine(appData, "MeshChat", "Logs");
-        Directory.CreateDirectory(logDir);
-        LogFilePath = Path.Combine(logDir, $"meshchat_{DateTime.Now:yyyy-MM-dd}.log");
+        _logDirectory = Path.Combine(appData, "MeshChat", "Logs");
+        Directory.CreateDirectory(_logDirectory);
     }
 
-    public static void Log(string message, LogLevel level = LogLevel.Info)
+    public ILogger CreateLogger(string categoryName)
+        => new DailyFileLogger(categoryName, _logDirectory, _writeLock, () => _disposed);
+
+    public void Dispose()
     {
-        var entry = $"[{DateTime.Now:HH:mm:ss}] [{level}] {message}";
-        lock (LockObj)
+        _disposed = true;
+    }
+
+    private sealed class DailyFileLogger : ILogger
+    {
+        private readonly string _categoryName;
+        private readonly string _logDirectory;
+        private readonly object _writeLock;
+        private readonly Func<bool> _isDisposed;
+
+        public DailyFileLogger(
+            string categoryName,
+            string logDirectory,
+            object writeLock,
+            Func<bool> isDisposed)
         {
-            try
+            _categoryName = categoryName;
+            _logDirectory = logDirectory;
+            _writeLock = writeLock;
+            _isDisposed = isDisposed;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel)
+            => logLevel != Microsoft.Extensions.Logging.LogLevel.None;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (_isDisposed() || !IsEnabled(logLevel))
+                return;
+
+            var message = formatter(state, exception);
+            if (string.IsNullOrWhiteSpace(message) && exception == null)
+                return;
+
+            var timestamp = DateTime.Now;
+            var entry = new StringBuilder()
+                .Append('[').Append(timestamp.ToString("yyyy-MM-dd HH:mm:ss.fff")).Append("] ")
+                .Append('[').Append(logLevel).Append("] ")
+                .Append('[').Append(_categoryName).Append("] ")
+                .Append(message);
+
+            var properties = GetStructuredProperties(state);
+            if (properties.Count > 0)
             {
-                File.AppendAllText(LogFilePath, entry + Environment.NewLine);
+                entry.Append(" | ");
+                entry.Append(string.Join(", ", properties.Select(p => $"{p.Key}={p.Value}")));
             }
-            catch { }
+
+            if (exception != null)
+                entry.AppendLine().Append(exception);
+
+            var filePath = Path.Combine(_logDirectory, $"meshchat_{timestamp:yyyy-MM-dd}.log");
+
+            lock (_writeLock)
+            {
+                try
+                {
+                    // The target file is resolved per write, so long-running sessions
+                    // automatically rotate when the calendar day changes.
+                    File.AppendAllText(filePath, entry + Environment.NewLine);
+                }
+                catch
+                {
+                    // Logging must never crash the chat app; failures here are ignored.
+                }
+            }
+        }
+
+        private static List<KeyValuePair<string, object?>> GetStructuredProperties<TState>(TState state)
+        {
+            if (state is not IEnumerable<KeyValuePair<string, object?>> values)
+                return [];
+
+            return values
+                .Where(value => value.Key != "{OriginalFormat}")
+                .ToList();
         }
     }
 
-    public static void Error(string message, Exception? ex = null)
+    private sealed class NullScope : IDisposable
     {
-        var msg = ex != null ? $"{message}: {ex.Message}\n{ex.StackTrace}" : message;
-        Log(msg, Models.LogLevel.Error);
-    }
+        public static NullScope Instance { get; } = new();
 
-    public static void Warning(string message) => Log(message, Models.LogLevel.Warning);
-    public static void Info(string message) => Log(message, Models.LogLevel.Info);
+        public void Dispose()
+        {
+        }
+    }
 }

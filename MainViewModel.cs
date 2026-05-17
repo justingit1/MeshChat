@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -6,6 +8,7 @@ using System.Media;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -14,22 +17,30 @@ using MeshChat.Models;
 using MeshChat.Services;
 using Newtonsoft.Json;
 using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using LogLevel = MeshChat.Models.LogLevel;
 
 namespace MeshChat.ViewModels;
 
 public partial class MainViewModel : ObservableObject
 {
-    private readonly WiFiService _wifi;
-    private readonly BluetoothService _bluetooth;
-    private readonly FileTransferService _fileTransfer;
+    // MainViewModel talks to transports through INetworkService so WiFi and
+    // Bluetooth can share send/receive/discovery handling without concrete coupling.
+    private readonly INetworkService _wifi;
+    private readonly INetworkService _bluetooth;
+    private readonly IFileTransferService _fileTransfer;
     private readonly Dispatcher _dispatcher;
     private readonly MessageStore _messageStore;
+    private readonly ILogger<MainViewModel> _logger;
 
     // ─── Observable State ───────────────────────────────────────────────────
 
     public ObservableCollection<Peer> Peers { get; } = [];
-    public ObservableCollection<ChatMessage> Messages { get; } = [];
-    public ObservableCollection<LogEntry> Logs { get; } = [];
+    public BulkObservableCollection<ChatMessage> Messages { get; } = [];
+    public BulkObservableCollection<LogEntry> Logs { get; } = [];
+    public ICollectionView FilteredMessages { get; }
+    public ICollectionView FilteredLogs { get; }
 
     private Peer? _selectedPeer;
     public Peer? SelectedPeer
@@ -64,12 +75,12 @@ public partial class MainViewModel : ObservableObject
             if ((now - _lastTypingSent).TotalMilliseconds > TypingSendIntervalMs)
             {
                 _lastTypingSent = now;
-                _ = SendTypingIndicatorAsync();
+                _ = SendTypingIndicatorAsync(_lifetimeCts.Token);
             }
         }
     }
 
-    private async Task SendTypingIndicatorAsync()
+    private async Task SendTypingIndicatorAsync(CancellationToken cancellationToken = default)
     {
         if (SelectedPeer == null) return;
 
@@ -81,53 +92,59 @@ public partial class MainViewModel : ObservableObject
             TargetId = SelectedPeer.Id
         };
 
-        await SendToPeerViaTransportAsync(SelectedPeer.Id, packet);
+        await SendToPeerViaTransportAsync(SelectedPeer.Id, packet, cancellationToken);
     }
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(FilteredMessages))]
     private string _searchQuery = string.Empty;
 
-    public IEnumerable<ChatMessage> FilteredMessages
+    partial void OnSearchQueryChanged(string value)
     {
-        get
-        {
-            if (string.IsNullOrWhiteSpace(SearchQuery))
-                return Messages;
-
-            var query = SearchQuery.Trim();
-            return Messages.Where(m =>
-                m.Content.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                (m.SenderName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false) ||
-                (m.FileName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false));
-        }
+        // CollectionView filtering refreshes the existing virtualized view instead
+        // of rebuilding LINQ enumerables during scrolling and auto-scroll checks.
+        FilteredMessages.Refresh();
     }
 
     // Log filter options
     public string[] LogFilterOptions { get; } = { "All", "WiFi", "Bluetooth", "Errors", "Messages" };
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(FilteredLogs))]
     private string _logFilter = "All";
 
-    public IEnumerable<LogEntry> FilteredLogs
+    partial void OnLogFilterChanged(string value)
     {
-        get
-        {
-            if (LogFilter == "All")
-                return Logs;
+        FilteredLogs.Refresh();
+    }
 
-            return Logs.Where(l => LogFilter switch
-            {
-                "WiFi" => l.Tag.StartsWith("WiFi"),
-                "Bluetooth" => l.Tag.StartsWith("Bluetooth"),
-                "Errors" => l.Tag.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
-                            l.Message.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
-                            l.Message.Contains("failed", StringComparison.OrdinalIgnoreCase),
-                "Messages" => l.Tag.Contains("SENT") || l.Tag.Contains("RECEIVED"),
-                _ => true
-            });
-        }
+    private bool FilterMessage(object item)
+    {
+        if (item is not ChatMessage message)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(SearchQuery))
+            return true;
+
+        var query = SearchQuery.Trim();
+        return message.Content.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+               (message.SenderName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false) ||
+               (message.FileName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false);
+    }
+
+    private bool FilterLogEntry(object item)
+    {
+        if (item is not LogEntry log)
+            return false;
+
+        return LogFilter == "All" || LogFilter switch
+        {
+            "WiFi" => log.Tag.StartsWith("WiFi"),
+            "Bluetooth" => log.Tag.StartsWith("Bluetooth"),
+            "Errors" => log.Tag.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                        log.Message.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                        log.Message.Contains("failed", StringComparison.OrdinalIgnoreCase),
+            "Messages" => log.Tag.Contains("SENT") || log.Tag.Contains("RECEIVED"),
+            _ => true
+        };
     }
 
     [ObservableProperty]
@@ -178,8 +195,14 @@ public partial class MainViewModel : ObservableObject
 
     private async Task HideToastAfterDelay()
     {
-        await Task.Delay(3000);
-        ToastMessage = string.Empty;
+        try
+        {
+            await Task.Delay(3000, _lifetimeCts.Token);
+            ToastMessage = string.Empty;
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     [ObservableProperty]
@@ -238,51 +261,88 @@ public partial class MainViewModel : ObservableObject
     private readonly Dictionary<string, ChatMessage> _messageById = [];
     private readonly Dictionary<string, Dictionary<string, HashSet<string>>> _reactionUsersByMessage = [];
     private readonly SemaphoreSlim _saveLock = new(1, 1);
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly object _logBatchLock = new();
+    private readonly List<LogEntry> _pendingLogEntries = [];
     private int _saveVersion;
+    private bool _logFlushQueued;
     private const int SaveDebounceMs = 500;
     private const int MaxVisibleHistoryMessages = 500;
+    private const int MaxVisibleLogs = 200;
 
     // ─── Transport Routing Helpers ──────────────────────────────────────────
 
-    private async Task SendToPeerViaTransportAsync(string peerId, NetworkPacket packet)
+    private async Task SendToPeerViaTransportAsync(string peerId, NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         if (!_peerById.TryGetValue(peerId, out var peer))
         {
             // Default to WiFi if peer not found
-            await _wifi.SendToPeerAsync(peerId, packet);
+            await _wifi.SendToPeerAsync(peerId, packet, cancellationToken);
             return;
         }
 
         // Use appropriate transport based on peer's connection type
         if (peer.Transport == TransportType.Bluetooth)
-            await _bluetooth.SendToPeerAsync(peerId, packet);
+            await _bluetooth.SendToPeerAsync(peerId, packet, cancellationToken);
         else
-            await _wifi.SendToPeerAsync(peerId, packet);
+            await _wifi.SendToPeerAsync(peerId, packet, cancellationToken);
     }
 
-    private async Task SendToAllViaTransportAsync(NetworkPacket packet)
+    private async Task SendToAllViaTransportAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         // Broadcast via both transports to ensure all peers receive it
-        await _wifi.SendToAllAsync(packet);
-        await _bluetooth.SendToAllAsync(packet);
+        await _wifi.SendToAllAsync(packet, cancellationToken);
+        await _bluetooth.SendToAllAsync(packet, cancellationToken);
     }
 
     // ─── Constructor ────────────────────────────────────────────────────────
 
     public MainViewModel()
+        : this(
+            new WiFiService(),
+            new BluetoothService(),
+            new FileTransferService(),
+            new MessageStore(),
+            NullLogger<MainViewModel>.Instance)
+    {
+    }
+
+    public MainViewModel(INetworkService wifi, INetworkService bluetooth)
+        : this(
+            wifi,
+            bluetooth,
+            new FileTransferService(),
+            new MessageStore(),
+            NullLogger<MainViewModel>.Instance)
+    {
+    }
+
+    public MainViewModel(
+        INetworkService wifi,
+        INetworkService bluetooth,
+        IFileTransferService fileTransfer,
+        MessageStore messageStore,
+        ILogger<MainViewModel>? logger = null)
     {
         _dispatcher = Application.Current.Dispatcher;
-        _wifi = new WiFiService();
-        _bluetooth = new BluetoothService();
-        _fileTransfer = new FileTransferService();
-        _messageStore = new MessageStore();
+        _wifi = wifi;
+        _bluetooth = bluetooth;
+        _fileTransfer = fileTransfer;
+        _messageStore = messageStore;
+        _logger = logger ?? NullLogger<MainViewModel>.Instance;
+
+        FilteredMessages = CollectionViewSource.GetDefaultView(Messages);
+        FilteredMessages.Filter = FilterMessage;
+        FilteredLogs = CollectionViewSource.GetDefaultView(Logs);
+        FilteredLogs.Filter = FilterLogEntry;
 
         DisplayName = Environment.MachineName;
 
         // Load persisted messages
-        _ = LoadPersistedMessagesAsync();
+        _ = LoadPersistedMessagesAsync(_lifetimeCts.Token);
 
-        // Wire up events
+        // The interface exposes the same discovery, receive, and log events for
+        // every transport, so both services can be wired to one set of handlers.
         _wifi.PeerDiscovered += OnPeerDiscovered;
         _wifi.PeerLost += OnPeerLost;
         _wifi.PacketReceived += OnPacketReceived;
@@ -297,14 +357,17 @@ public partial class MainViewModel : ObservableObject
         _fileTransfer.FileReceived += OnFileReceived;
         _fileTransfer.LogMessage += AddLog;
 
-        Messages.CollectionChanged += (_, _) => OnPropertyChanged(nameof(FilteredMessages));
-        Logs.CollectionChanged += (_, _) => OnPropertyChanged(nameof(FilteredLogs));
+        // Range collection notifications collapse hundreds of message/log updates
+        // into one view refresh, keeping the dispatcher free for input and animations.
     }
 
     // ─── Startup ────────────────────────────────────────────────────────────
 
-    public async Task StartAsync()
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCts.Token, cancellationToken);
+        cancellationToken = linkedCts.Token;
+
         // Add startup banner for presentation
         AddLog("══════════════════════════════════════", LogLevel.Info);
         AddLog("   MeshChat - Offline P2P Messenger", LogLevel.Info);
@@ -317,7 +380,7 @@ public partial class MainViewModel : ObservableObject
 
         // WiFi startup
         AddLog("[WiFi] Starting TCP server...", LogLevel.WiFi);
-        await _wifi.StartAsync();
+        await _wifi.StartAsync(cancellationToken);
         IsWifiConnected = _wifi.IsRunning;
 
         if (IsWifiConnected)
@@ -328,7 +391,7 @@ public partial class MainViewModel : ObservableObject
 
         // Bluetooth startup
         AddLog("[Bluetooth] Scanning for devices...", LogLevel.Bluetooth);
-        await _bluetooth.StartAsync();
+        await _bluetooth.StartAsync(cancellationToken);
         IsBluetoothAvailable = _bluetooth.IsAvailable;
 
         if (IsBluetoothAvailable)
@@ -358,22 +421,23 @@ public partial class MainViewModel : ObservableObject
 
     public void Stop()
     {
+        _lifetimeCts.Cancel();
         _wifi.Stop();
         _bluetooth.Stop();
     }
 
     // ─── Manual Connect ─────────────────────────────────────────────────────
 
-    public async Task ConnectManualAsync()
+    public async Task ConnectManualAsync(CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(ConnectIp)) return;
         if (!int.TryParse(ConnectPort, out int port)) port = 45678;
-        await _wifi.ConnectToPeerAsync(ConnectIp.Trim(), port);
+        await _wifi.ConnectToPeerAsync(ConnectIp.Trim(), port, cancellationToken);
     }
 
     // ─── Messaging ──────────────────────────────────────────────────────────
 
-    public async Task SendMessageAsync()
+    public async Task SendMessageAsync(CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(MessageInput)) return;
         if (SelectedPeer == null)
@@ -418,19 +482,19 @@ public partial class MainViewModel : ObservableObject
 
         if (SelectedPeer != null)
         {
-            await SendToPeerViaTransportAsync(SelectedPeer.Id, packet);
+            await SendToPeerViaTransportAsync(SelectedPeer.Id, packet, cancellationToken);
             // Log the send event with visual indicator
             AddLog($"[SENT \u2191] To: {SelectedPeer.DisplayName} via {transport}", LogLevel.Sent);
         }
         else
         {
-            await SendToAllViaTransportAsync(packet);
+            await SendToAllViaTransportAsync(packet, cancellationToken);
             // Log broadcast
             AddLog($"[SENT \u2191] Broadcast to all peers via {transport}", LogLevel.Sent);
         }
     }
 
-    public async Task SendFileAsync(string filePath)
+    public async Task SendFileAsync(string filePath, CancellationToken cancellationToken = default)
     {
         if (SelectedPeer == null) return;
 
@@ -451,9 +515,9 @@ public partial class MainViewModel : ObservableObject
         Messages.Add(msg);
 
         await foreach (var packet in _fileTransfer.ChunkFileAsync(
-            filePath, SelectedPeer.Id, _wifi.LocalId, DisplayName))
+            filePath, SelectedPeer.Id, _wifi.LocalId, DisplayName, cancellationToken))
         {
-            await SendToPeerViaTransportAsync(SelectedPeer.Id, packet);
+            await SendToPeerViaTransportAsync(SelectedPeer.Id, packet, cancellationToken);
         }
 
         msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
@@ -525,7 +589,7 @@ public partial class MainViewModel : ObservableObject
             switch (packet.Type)
             {
                 case PacketType.Message:
-                    _ = HandleIncomingMessageAsync(packet);
+                    _ = HandleIncomingMessageAsync(packet, _lifetimeCts.Token);
                     break;
 
                 case PacketType.MessageAck:
@@ -555,7 +619,7 @@ public partial class MainViewModel : ObservableObject
         });
     }
 
-    private async Task HandleIncomingMessageAsync(NetworkPacket packet)
+    private async Task HandleIncomingMessageAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         if (packet.Payload == null) return;
 
@@ -591,7 +655,7 @@ public partial class MainViewModel : ObservableObject
                     SenderName = DisplayName,
                     Payload = msg.Id
                 };
-                await SendToPeerViaTransportAsync(peerId, ack);
+                await SendToPeerViaTransportAsync(peerId, ack, cancellationToken);
             }
         }
         else
@@ -612,7 +676,7 @@ public partial class MainViewModel : ObservableObject
             SenderName = DisplayName,
             Payload = msg.Id
         };
-        await SendToPeerViaTransportAsync(peerId, deliveryAck);
+        await SendToPeerViaTransportAsync(peerId, deliveryAck, cancellationToken);
 
         // Log the receive event with visual indicator
         var senderName = packet.SenderName ?? "Unknown";
@@ -634,7 +698,7 @@ public partial class MainViewModel : ObservableObject
             ReplaceMessage(msg, msg with { Status = MessageStatus.Read });
     }
 
-    public async Task AddReactionAsync(string messageId, string emoji)
+    public async Task AddReactionAsync(string messageId, string emoji, CancellationToken cancellationToken = default)
     {
         // Find the message
         if (!_messageById.TryGetValue(messageId, out var msg)) return;
@@ -670,11 +734,11 @@ public partial class MainViewModel : ObservableObject
         // Send to the message sender (for directed messages) or broadcast for group
         if (!string.IsNullOrEmpty(msg.SenderId) && msg.SenderId != _wifi.LocalId)
         {
-            await SendToPeerViaTransportAsync(msg.SenderId, packet);
+            await SendToPeerViaTransportAsync(msg.SenderId, packet, cancellationToken);
         }
         else
         {
-            await SendToAllViaTransportAsync(packet);
+            await SendToAllViaTransportAsync(packet, cancellationToken);
         }
 
         AddLog(isAdding ? $"[REACTION] You reacted {emoji} to a message" : $"[REACTION] You removed {emoji} reaction");
@@ -750,7 +814,7 @@ public partial class MainViewModel : ObservableObject
             _messageHistory[peerId] = history = [];
         history.Add(msg);
         IndexMessage(msg);
-        _ = SaveMessagesAsync();
+        _ = SaveMessagesAsync(_lifetimeCts.Token);
     }
 
     private ChatMessage ReplaceMessage(ChatMessage current, ChatMessage updated)
@@ -772,7 +836,7 @@ public partial class MainViewModel : ObservableObject
 
         _messageById[updated.Id] = updated;
         IndexReactions(updated);
-        _ = SaveMessagesAsync();
+        _ = SaveMessagesAsync(_lifetimeCts.Token);
         return updated;
     }
 
@@ -794,11 +858,11 @@ public partial class MainViewModel : ObservableObject
         return updated;
     }
 
-    private async Task LoadPersistedMessagesAsync()
+    private async Task LoadPersistedMessagesAsync(CancellationToken cancellationToken)
     {
         try
         {
-            var messages = await Task.Run(() => _messageStore.Load());
+            var messages = await Task.Run(() => _messageStore.Load(), cancellationToken);
             foreach (var msg in messages)
             {
                 // For simplicity, store all messages under "broadcast" key
@@ -808,39 +872,45 @@ public partial class MainViewModel : ObservableObject
                 broadcast.Add(msg);
                 IndexMessage(msg);
             }
-            Logger.Info($"Loaded {messages.Count} persisted messages");
+            _logger.LogInformation("Loaded {MessageCount} persisted messages", messages.Count);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
-            Logger.Error("Failed to load persisted messages", ex);
+            _logger.LogError(ex, "Failed to load persisted messages");
         }
     }
 
-    private async Task SaveMessagesAsync()
+    private async Task SaveMessagesAsync(CancellationToken cancellationToken)
     {
         try
         {
             var saveVersion = Interlocked.Increment(ref _saveVersion);
-            await Task.Delay(SaveDebounceMs);
+            await Task.Delay(SaveDebounceMs, cancellationToken);
 
             if (saveVersion != Volatile.Read(ref _saveVersion))
                 return;
 
             var allMessages = _messageHistory.Values.SelectMany(m => m).ToList();
 
-            await _saveLock.WaitAsync();
+            await _saveLock.WaitAsync(cancellationToken);
             try
             {
-                await Task.Run(() => _messageStore.Save(allMessages));
+                await Task.Run(() => _messageStore.Save(allMessages), cancellationToken);
             }
             finally
             {
                 _saveLock.Release();
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
         catch (Exception ex)
         {
-            Logger.Error("Failed to save messages", ex);
+            _logger.LogError(ex, "Failed to save messages");
         }
     }
 
@@ -924,30 +994,38 @@ public partial class MainViewModel : ObservableObject
 
     private void LoadMessagesForPeer(Peer? peer)
     {
-        Messages.Clear();
-
         if (peer == null)
         {
             // Load broadcast history with date separators
-            if (_messageHistory.TryGetValue("broadcast", out var broadcast))
-                LoadMessagesWithDateSeparators(broadcast);
+            _messageHistory.TryGetValue("broadcast", out var broadcastHistory);
+            ReplaceVisibleMessages(broadcastHistory ?? []);
             return;
         }
 
         peer = ReplacePeer(peer, peer with { UnreadCount = 0 });
 
         if (_messageHistory.TryGetValue(peer.Id, out var history))
-            LoadMessagesWithDateSeparators(history);
+            ReplaceVisibleMessages(history);
+        else
+            ReplaceVisibleMessages([]);
 
         UpdateUnreadCounts();
     }
 
-    private void LoadMessagesWithDateSeparators(List<ChatMessage> history)
+    private void ReplaceVisibleMessages(List<ChatMessage> history)
+    {
+        // Build the visible window off-collection, then publish it as one Reset.
+        // This avoids hundreds of per-item collection events when changing peers.
+        Messages.ReplaceAll(BuildMessagesWithDateSeparators(history));
+    }
+
+    private static List<ChatMessage> BuildMessagesWithDateSeparators(List<ChatMessage> history)
     {
         DateTime? lastDate = null;
         var visibleHistory = history.Count > MaxVisibleHistoryMessages
             ? history.Skip(history.Count - MaxVisibleHistoryMessages)
             : history;
+        var visibleMessages = new List<ChatMessage>();
 
         foreach (var msg in visibleHistory)
         {
@@ -957,7 +1035,7 @@ public partial class MainViewModel : ObservableObject
                 if (lastDate == null || msg.Timestamp.Date != lastDate.Value.Date)
                 {
                     var separatorText = GetDateSeparatorText(msg.Timestamp);
-                    Messages.Add(new ChatMessage
+                    visibleMessages.Add(new ChatMessage
                     {
                         Type = MessageType.DateSeparator,
                         Content = separatorText,
@@ -967,11 +1045,13 @@ public partial class MainViewModel : ObservableObject
                     lastDate = msg.Timestamp.Date;
                 }
             }
-            Messages.Add(msg);
+            visibleMessages.Add(msg);
         }
+
+        return visibleMessages;
     }
 
-    private string GetDateSeparatorText(DateTime date)
+    private static string GetDateSeparatorText(DateTime date)
     {
         var today = DateTime.Today;
         var yesterday = today.AddDays(-1);
@@ -1002,10 +1082,17 @@ public partial class MainViewModel : ObservableObject
             TypingPeerName = peerName;
         }
 
-        // Schedule hide
-        Task.Delay(TypingIndicatorDurationMs).ContinueWith(_ =>
+        // Pass the view-model lifetime token so delayed typing cleanup does not
+        // resume after the window closes.
+        _ = HideTypingIndicatorAfterDelayAsync(peerId, _lifetimeCts.Token);
+    }
+
+    private async Task HideTypingIndicatorAfterDelayAsync(string peerId, CancellationToken cancellationToken)
+    {
+        try
         {
-            _dispatcher.Invoke(() =>
+            await Task.Delay(TypingIndicatorDurationMs, cancellationToken);
+            await _dispatcher.InvokeAsync(() =>
             {
                 if (_typingTimers.TryGetValue(peerId, out var expiry) && expiry <= DateTime.Now)
                 {
@@ -1016,29 +1103,66 @@ public partial class MainViewModel : ObservableObject
                         TypingPeerName = string.Empty;
                     }
                 }
-            });
-        });
+            }, DispatcherPriority.Background, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     private void AddLog(string msg)
     {
-        _dispatcher.Invoke(() =>
-        {
-            var entry = CreateLogEntry(msg);
-            Logs.Insert(0, entry);
-            if (Logs.Count > 200) Logs.RemoveAt(Logs.Count - 1);
-        });
+        _logger.LogInformation("UI log: {Message}", msg);
+        QueueLogEntry(CreateLogEntry(msg));
     }
 
     private void AddLog(string msg, LogLevel level)
     {
-        _dispatcher.Invoke(() =>
-        {
-            var entry = CreateLogEntry(msg, level);
-            Logs.Insert(0, entry);
-            if (Logs.Count > 200) Logs.RemoveAt(Logs.Count - 1);
-        });
+        _logger.Log(ToMicrosoftLogLevel(level), "UI log {UiLogLevel}: {Message}", level, msg);
+        QueueLogEntry(CreateLogEntry(msg, level));
     }
+
+    private void QueueLogEntry(LogEntry entry)
+    {
+        lock (_logBatchLock)
+        {
+            _pendingLogEntries.Add(entry);
+            if (_logFlushQueued)
+                return;
+
+            _logFlushQueued = true;
+        }
+
+        // Coalesce bursts from startup and network callbacks into one dispatcher
+        // operation so logging cannot starve input or storyboard frames.
+        _dispatcher.BeginInvoke(FlushPendingLogs, DispatcherPriority.Background);
+    }
+
+    private void FlushPendingLogs()
+    {
+        List<LogEntry> batch;
+        lock (_logBatchLock)
+        {
+            batch = [.. _pendingLogEntries];
+            _pendingLogEntries.Clear();
+            _logFlushQueued = false;
+        }
+
+        if (batch.Count == 0)
+            return;
+
+        batch.Reverse();
+        Logs.InsertRange(0, batch);
+        while (Logs.Count > MaxVisibleLogs)
+            Logs.RemoveAt(Logs.Count - 1);
+    }
+
+    private static Microsoft.Extensions.Logging.LogLevel ToMicrosoftLogLevel(LogLevel level) => level switch
+    {
+        LogLevel.Warning => Microsoft.Extensions.Logging.LogLevel.Warning,
+        LogLevel.Error => Microsoft.Extensions.Logging.LogLevel.Error,
+        _ => Microsoft.Extensions.Logging.LogLevel.Information
+    };
 
     private LogEntry CreateLogEntry(string msg)
     {
@@ -1123,24 +1247,41 @@ public partial class MainViewModel : ObservableObject
         return (Color)ColorConverter.ConvertFromString(hex);
     }
 
-    // ─── Simple Encryption (XOR with shared key) ─────────────────────────────
-    // Note: For production, use proper AES-256 with key exchange
+    // ─── Message Encryption (AES-GCM with shared key) ────────────────────────
     private const string EncryptionKey = "MeshChatSecretKey2024!";
 
     private string Encrypt(string plainText)
     {
         if (string.IsNullOrEmpty(plainText) || !EncryptionEnabled) return plainText;
 
-        var keyBytes = System.Text.Encoding.UTF8.GetBytes(EncryptionKey);
-        var textBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
-        var result = new byte[textBytes.Length];
+        // AES-GCM provides authenticated encryption, so tampered ciphertext fails
+        // during decryption instead of producing corrupted JSON.
+        const int nonceSize = 12; // 96-bit nonce is the standard size for GCM.
+        const int tagSize = 16;   // 128-bit authentication tag.
 
-        for (int i = 0; i < textBytes.Length; i++)
-        {
-            result[i] = (byte)(textBytes[i] ^ keyBytes[i % keyBytes.Length]);
-        }
+        // Hash the shared passphrase into a fixed 256-bit key expected by AES.
+        // This preserves the existing shared-key model; a real deployment should
+        // exchange or derive this key per peer instead of hard-coding it.
+        var keyBytes = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(EncryptionKey));
+        var nonce = new byte[nonceSize];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(nonce);
 
-        return Convert.ToBase64String(result);
+        var plainBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
+        var cipherBytes = new byte[plainBytes.Length];
+        var tag = new byte[tagSize];
+
+        using var aes = new System.Security.Cryptography.AesGcm(keyBytes, tagSize);
+        aes.Encrypt(nonce, plainBytes, cipherBytes, tag);
+
+        // Keep packet serialization unchanged by storing binary crypto fields as
+        // a single Base64 payload string: nonce | tag | ciphertext.
+        var encryptedBytes = new byte[nonce.Length + tag.Length + cipherBytes.Length];
+        Buffer.BlockCopy(nonce, 0, encryptedBytes, 0, nonce.Length);
+        Buffer.BlockCopy(tag, 0, encryptedBytes, nonce.Length, tag.Length);
+        Buffer.BlockCopy(cipherBytes, 0, encryptedBytes, nonce.Length + tag.Length, cipherBytes.Length);
+
+        return "AESGCM1:" + Convert.ToBase64String(encryptedBytes);
     }
 
     private string Decrypt(string encryptedText)
@@ -1149,21 +1290,99 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            var keyBytes = System.Text.Encoding.UTF8.GetBytes(EncryptionKey);
-            var encryptedBytes = Convert.FromBase64String(encryptedText);
-            var result = new byte[encryptedBytes.Length];
+            const string prefix = "AESGCM1:";
+            const int nonceSize = 12;
+            const int tagSize = 16;
 
-            for (int i = 0; i < encryptedBytes.Length; i++)
-            {
-                result[i] = (byte)(encryptedBytes[i] ^ keyBytes[i % keyBytes.Length]);
-            }
+            // Messages without the AES-GCM prefix are treated as plaintext so
+            // peers can still interoperate when encryption is disabled.
+            if (!encryptedText.StartsWith(prefix, StringComparison.Ordinal))
+                return encryptedText;
 
-            return System.Text.Encoding.UTF8.GetString(result);
+            var encryptedBytes = Convert.FromBase64String(encryptedText[prefix.Length..]);
+            if (encryptedBytes.Length < nonceSize + tagSize)
+                return encryptedText;
+
+            var nonce = encryptedBytes[..nonceSize];
+            var tag = encryptedBytes[nonceSize..(nonceSize + tagSize)];
+            var cipherBytes = encryptedBytes[(nonceSize + tagSize)..];
+            var plainBytes = new byte[cipherBytes.Length];
+
+            // Derive the same 256-bit AES key from the shared passphrase used by
+            // Encrypt; the random nonce is stored with each packet, not secret.
+            var keyBytes = System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(EncryptionKey));
+
+            using var aes = new System.Security.Cryptography.AesGcm(keyBytes, tagSize);
+            aes.Decrypt(nonce, cipherBytes, tag, plainBytes);
+
+            return System.Text.Encoding.UTF8.GetString(plainBytes);
         }
         catch
         {
-            return encryptedText; // Return as-is if decryption fails (not encrypted)
+            return encryptedText; // Return as-is if decryption fails (not encrypted or wrong key)
         }
     }
 
+}
+
+public sealed class BulkObservableCollection<T> : ObservableCollection<T>
+{
+    private bool _suppressNotifications;
+
+    public void ReplaceAll(IEnumerable<T> items)
+    {
+        _suppressNotifications = true;
+        try
+        {
+            Items.Clear();
+            foreach (var item in items)
+                Items.Add(item);
+        }
+        finally
+        {
+            _suppressNotifications = false;
+        }
+
+        RaiseReset();
+    }
+
+    public void InsertRange(int index, IEnumerable<T> items)
+    {
+        var inserted = items.ToList();
+        if (inserted.Count == 0)
+            return;
+
+        _suppressNotifications = true;
+        try
+        {
+            for (var i = 0; i < inserted.Count; i++)
+                Items.Insert(index + i, inserted[i]);
+        }
+        finally
+        {
+            _suppressNotifications = false;
+        }
+
+        RaiseReset();
+    }
+
+    protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
+    {
+        if (!_suppressNotifications)
+            base.OnCollectionChanged(e);
+    }
+
+    protected override void OnPropertyChanged(PropertyChangedEventArgs e)
+    {
+        if (!_suppressNotifications)
+            base.OnPropertyChanged(e);
+    }
+
+    private void RaiseReset()
+    {
+        base.OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+        base.OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+        base.OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+    }
 }

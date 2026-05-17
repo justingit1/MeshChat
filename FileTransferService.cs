@@ -1,7 +1,13 @@
 using System;
+using System.Buffers;
+using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using MeshChat.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 
 namespace MeshChat.Services;
@@ -23,21 +29,48 @@ public class FileChunkPayload
     public long TotalSize { get; set; }
     public int ChunkIndex { get; set; }
     public int TotalChunks { get; set; }
-    public byte[]? Data { get; set; }
+    public string? Data { get; set; }
 }
 
-public class FileTransferService
+public interface IFileTransferService
+{
+    event Action<string, double>? ProgressUpdated;   // messageId, 0-1
+    event Action<string, string>? FileReceived;       // messageId, saved path
+    event Action<string>? LogMessage;
+
+    IAsyncEnumerable<NetworkPacket> ChunkFileAsync(
+        string filePath,
+        string targetId,
+        string senderId,
+        string senderName,
+        CancellationToken cancellationToken = default);
+
+    void HandleChunk(NetworkPacket packet);
+}
+
+public class FileTransferService : IFileTransferService
 {
     private const int ChunkSize = 32 * 1024; // 32KB per chunk
+    private const string ServiceName = "FileTransfer";
 
+    private readonly ILogger<FileTransferService> _logger;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FileTransferInfo> _incoming = new();
 
     public event Action<string, double>? ProgressUpdated;   // messageId, 0-1
     public event Action<string, string>? FileReceived;       // messageId, saved path
     public event Action<string>? LogMessage;
 
+    public FileTransferService(ILogger<FileTransferService>? logger = null)
+    {
+        _logger = logger ?? NullLogger<FileTransferService>.Instance;
+    }
+
     public async IAsyncEnumerable<NetworkPacket> ChunkFileAsync(
-        string filePath, string targetId, string senderId, string senderName)
+        string filePath,
+        string targetId,
+        string senderId,
+        string senderName,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var fileInfo = new FileInfo(filePath);
         var messageId = Guid.NewGuid().ToString();
@@ -45,15 +78,16 @@ public class FileTransferService
 
         using var fs = File.OpenRead(filePath);
         var buffer = new byte[ChunkSize];
+        var chunkBuffer = buffer.AsMemory();
         int chunkIndex = 0;
 
         while (true)
         {
-            var bytesRead = await fs.ReadAsync(buffer);
+            // Reuse one 32KB Memory<byte> buffer for all reads. The payload stores
+            // base64 text directly, matching the previous byte[] JSON shape while
+            // avoiding a separate per-chunk byte[] allocation before serialization.
+            var bytesRead = await fs.ReadAsync(chunkBuffer, cancellationToken);
             if (bytesRead == 0) break;
-
-            var chunk = new byte[bytesRead];
-            Array.Copy(buffer, chunk, bytesRead);
 
             var payload = new FileChunkPayload
             {
@@ -62,7 +96,7 @@ public class FileTransferService
                 TotalSize = fileInfo.Length,
                 ChunkIndex = chunkIndex,
                 TotalChunks = totalChunks,
-                Data = chunk
+                Data = Convert.ToBase64String(chunkBuffer.Span[..bytesRead])
             };
 
             yield return new NetworkPacket
@@ -78,9 +112,13 @@ public class FileTransferService
             chunkIndex++;
 
             // Small delay to avoid flooding the connection
-            await Task.Delay(5);
+            await Task.Delay(5, cancellationToken);
         }
 
+        _logger.LogInformation(
+            "Sent {ChunkCount} chunks for {FileName}",
+            chunkIndex,
+            fileInfo.Name);
         Log($"Sent {chunkIndex} chunks for {fileInfo.Name}");
     }
 
@@ -96,11 +134,30 @@ public class FileTransferService
             MessageId = chunk.MessageId,
             FileName = chunk.FileName,
             TotalSize = chunk.TotalSize,
-            TotalChunks = chunk.TotalChunks
+            TotalChunks = chunk.TotalChunks,
+            // Pre-size the receive buffer when practical so MemoryStream does not
+            // repeatedly allocate and copy as chunks arrive.
+            Buffer = CreateReceiveBuffer(chunk.TotalSize)
         });
 
-        if (chunk.Data != null)
-            transfer.Buffer.Write(chunk.Data);
+        if (!string.IsNullOrEmpty(chunk.Data))
+        {
+            // Decode into a pooled byte[] and write through Span<byte>; this avoids
+            // allocating a fresh receive buffer for every chunk.
+            var maxDecodedBytes = (chunk.Data.Length / 4) * 3;
+            var rented = ArrayPool<byte>.Shared.Rent(maxDecodedBytes);
+            try
+            {
+                if (Convert.TryFromBase64String(chunk.Data, rented, out var decodedBytes))
+                {
+                    transfer.Buffer.Write(rented.AsSpan(0, decodedBytes));
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
 
         transfer.ReceivedChunks++;
         var progress = (double)transfer.ReceivedChunks / transfer.TotalChunks;
@@ -135,14 +192,23 @@ public class FileTransferService
             using var fs = File.Create(savePath);
             transfer.Buffer.CopyTo(fs);
 
+            _logger.LogInformation("File saved to {SavePath}", savePath);
             Log($"File saved: {savePath}");
             FileReceived?.Invoke(transfer.MessageId, savePath);
         }
         catch (Exception ex)
         {
+            _logger.LogError(ex, "Failed to save file {FileName}", transfer.FileName);
             Log($"Failed to save file: {ex.Message}");
         }
     }
 
-    private void Log(string msg) => LogMessage?.Invoke($"[FileTransfer] {msg}");
+    private static MemoryStream CreateReceiveBuffer(long totalSize)
+    {
+        return totalSize is > 0 and <= int.MaxValue
+            ? new MemoryStream((int)totalSize)
+            : new MemoryStream();
+    }
+
+    private void Log(string msg) => LogMessage?.Invoke($"[{ServiceName}] {msg}");
 }
