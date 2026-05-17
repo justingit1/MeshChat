@@ -19,6 +19,8 @@ public class FileTransferInfo
     public long TotalSize { get; set; }
     public int TotalChunks { get; set; }
     public int ReceivedChunks { get; set; }
+    public long ReceivedBytes { get; set; }
+    public HashSet<int> ReceivedChunkIndexes { get; } = [];
     public MemoryStream Buffer { get; set; } = new();
 }
 
@@ -43,7 +45,8 @@ public interface IFileTransferService
         string targetId,
         string senderId,
         string senderName,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? messageId = null);
 
     void HandleChunk(NetworkPacket packet);
 }
@@ -70,11 +73,12 @@ public class FileTransferService : IFileTransferService
         string targetId,
         string senderId,
         string senderName,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        string? messageId = null)
     {
         var fileInfo = new FileInfo(filePath);
-        var messageId = Guid.NewGuid().ToString();
-        var totalChunks = (int)Math.Ceiling((double)fileInfo.Length / ChunkSize);
+        messageId ??= Guid.NewGuid().ToString();
+        var totalChunks = Math.Max(1, (int)Math.Ceiling((double)fileInfo.Length / ChunkSize));
 
         using var fs = File.OpenRead(filePath);
         var buffer = new byte[ChunkSize];
@@ -87,7 +91,7 @@ public class FileTransferService : IFileTransferService
             // base64 text directly, matching the previous byte[] JSON shape while
             // avoiding a separate per-chunk byte[] allocation before serialization.
             var bytesRead = await fs.ReadAsync(chunkBuffer, cancellationToken);
-            if (bytesRead == 0) break;
+            if (bytesRead == 0 && fileInfo.Length > 0) break;
 
             var payload = new FileChunkPayload
             {
@@ -110,6 +114,7 @@ public class FileTransferService : IFileTransferService
 
             ProgressUpdated?.Invoke(messageId, (double)(chunkIndex + 1) / totalChunks);
             chunkIndex++;
+            if (fileInfo.Length == 0) break;
 
             // Small delay to avoid flooding the connection
             await Task.Delay(5, cancellationToken);
@@ -128,6 +133,7 @@ public class FileTransferService : IFileTransferService
 
         var chunk = JsonConvert.DeserializeObject<FileChunkPayload>(packet.Payload);
         if (chunk == null) return;
+        if (!IsValidChunkMetadata(chunk)) return;
 
         var transfer = _incoming.GetOrAdd(chunk.MessageId, _ => new FileTransferInfo
         {
@@ -139,7 +145,15 @@ public class FileTransferService : IFileTransferService
             // repeatedly allocate and copy as chunks arrive.
             Buffer = CreateReceiveBuffer(chunk.TotalSize)
         });
+        if (transfer.FileName != chunk.FileName ||
+            transfer.TotalSize != chunk.TotalSize ||
+            transfer.TotalChunks != chunk.TotalChunks)
+        {
+            Log($"Rejected inconsistent chunk metadata for {chunk.MessageId}");
+            return;
+        }
 
+        var decodedBytes = 0;
         if (!string.IsNullOrEmpty(chunk.Data))
         {
             // Decode into a pooled byte[] and write through Span<byte>; this avoids
@@ -148,24 +162,40 @@ public class FileTransferService : IFileTransferService
             var rented = ArrayPool<byte>.Shared.Rent(maxDecodedBytes);
             try
             {
-                if (Convert.TryFromBase64String(chunk.Data, rented, out var decodedBytes))
-                {
-                    transfer.Buffer.Write(rented.AsSpan(0, decodedBytes));
-                }
+                if (!Convert.TryFromBase64String(chunk.Data, rented, out decodedBytes))
+                    return;
+
+                if (!IsExpectedChunkSize(chunk, decodedBytes))
+                    return;
+
+                transfer.Buffer.Position = (long)chunk.ChunkIndex * ChunkSize;
+                transfer.Buffer.Write(rented.AsSpan(0, decodedBytes));
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(rented);
             }
         }
+        else if (!IsExpectedChunkSize(chunk, decodedBytes))
+        {
+            return;
+        }
+
+        if (!transfer.ReceivedChunkIndexes.Add(chunk.ChunkIndex))
+            return;
 
         transfer.ReceivedChunks++;
+        transfer.ReceivedBytes += decodedBytes;
         var progress = (double)transfer.ReceivedChunks / transfer.TotalChunks;
         ProgressUpdated?.Invoke(chunk.MessageId, progress);
 
         if (transfer.ReceivedChunks >= transfer.TotalChunks)
         {
-            SaveFile(transfer);
+            if (transfer.ReceivedBytes == transfer.TotalSize)
+                SaveFile(transfer);
+            else
+                Log($"Rejected incomplete file {transfer.FileName}: expected {transfer.TotalSize} bytes, received {transfer.ReceivedBytes}");
+
             _incoming.TryRemove(chunk.MessageId, out _);
         }
     }
@@ -179,12 +209,13 @@ public class FileTransferService : IFileTransferService
                 "Downloads", "MeshChat");
             Directory.CreateDirectory(downloadsPath);
 
-            var savePath = Path.Combine(downloadsPath, transfer.FileName);
+            var safeFileName = SanitizeFileName(transfer.FileName);
+            var savePath = Path.Combine(downloadsPath, safeFileName);
             // Avoid overwriting existing files
             if (File.Exists(savePath))
             {
-                var name = Path.GetFileNameWithoutExtension(transfer.FileName);
-                var ext = Path.GetExtension(transfer.FileName);
+                var name = Path.GetFileNameWithoutExtension(safeFileName);
+                var ext = Path.GetExtension(safeFileName);
                 savePath = Path.Combine(downloadsPath, $"{name}_{DateTime.Now:HHmmss}{ext}");
             }
 
@@ -208,6 +239,36 @@ public class FileTransferService : IFileTransferService
         return totalSize is > 0 and <= int.MaxValue
             ? new MemoryStream((int)totalSize)
             : new MemoryStream();
+    }
+
+    private static bool IsValidChunkMetadata(FileChunkPayload chunk)
+    {
+        return !string.IsNullOrWhiteSpace(chunk.MessageId) &&
+               chunk.TotalSize >= 0 &&
+               chunk.TotalChunks > 0 &&
+               chunk.ChunkIndex >= 0 &&
+               chunk.ChunkIndex < chunk.TotalChunks;
+    }
+
+    private static bool IsExpectedChunkSize(FileChunkPayload chunk, int decodedBytes)
+    {
+        var expectedBytes = chunk.TotalSize == 0
+            ? 0
+            : (int)Math.Min(ChunkSize, chunk.TotalSize - (long)chunk.ChunkIndex * ChunkSize);
+
+        return expectedBytes >= 0 && decodedBytes == expectedBytes;
+    }
+
+    private static string SanitizeFileName(string fileName)
+    {
+        var safeName = Path.GetFileName(fileName);
+        if (string.IsNullOrWhiteSpace(safeName))
+            safeName = "received_file";
+
+        foreach (var invalidChar in Path.GetInvalidFileNameChars())
+            safeName = safeName.Replace(invalidChar, '_');
+
+        return safeName;
     }
 
     private void Log(string msg) => LogMessage?.Invoke($"[{ServiceName}] {msg}");

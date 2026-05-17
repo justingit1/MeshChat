@@ -515,7 +515,7 @@ public partial class MainViewModel : ObservableObject
         Messages.Add(msg);
 
         await foreach (var packet in _fileTransfer.ChunkFileAsync(
-            filePath, SelectedPeer.Id, _wifi.LocalId, DisplayName, cancellationToken))
+            filePath, SelectedPeer.Id, _wifi.LocalId, DisplayName, cancellationToken, msg.Id))
         {
             await SendToPeerViaTransportAsync(SelectedPeer.Id, packet, cancellationToken);
         }
@@ -626,10 +626,25 @@ public partial class MainViewModel : ObservableObject
         var payload = packet.Payload;
         if (EncryptionEnabled)
         {
-            payload = Decrypt(payload);
+            if (!TryDecrypt(payload, out payload))
+            {
+                AddLog($"Dropped encrypted message from {packet.SenderName ?? packet.SenderId}: decryption failed", LogLevel.Warning);
+                return;
+            }
         }
 
-        var msg = JsonConvert.DeserializeObject<ChatMessage>(payload);
+        ChatMessage? msg;
+        try
+        {
+            msg = JsonConvert.DeserializeObject<ChatMessage>(payload);
+        }
+        catch (JsonException ex)
+        {
+            AddLog($"Dropped message from {packet.SenderName ?? packet.SenderId}: invalid payload", LogLevel.Warning);
+            _logger.LogWarning(ex, "Dropped invalid message payload from {SenderId}", packet.SenderId);
+            return;
+        }
+
         if (msg == null) return;
 
         msg = msg with { Status = MessageStatus.Delivered };
@@ -1284,9 +1299,10 @@ public partial class MainViewModel : ObservableObject
         return "AESGCM1:" + Convert.ToBase64String(encryptedBytes);
     }
 
-    private string Decrypt(string encryptedText)
+    private bool TryDecrypt(string encryptedText, out string plainText)
     {
-        if (string.IsNullOrEmpty(encryptedText) || !EncryptionEnabled) return encryptedText;
+        plainText = encryptedText;
+        if (string.IsNullOrEmpty(encryptedText) || !EncryptionEnabled) return true;
 
         try
         {
@@ -1297,11 +1313,11 @@ public partial class MainViewModel : ObservableObject
             // Messages without the AES-GCM prefix are treated as plaintext so
             // peers can still interoperate when encryption is disabled.
             if (!encryptedText.StartsWith(prefix, StringComparison.Ordinal))
-                return encryptedText;
+                return true;
 
             var encryptedBytes = Convert.FromBase64String(encryptedText[prefix.Length..]);
             if (encryptedBytes.Length < nonceSize + tagSize)
-                return encryptedText;
+                return false;
 
             var nonce = encryptedBytes[..nonceSize];
             var tag = encryptedBytes[nonceSize..(nonceSize + tagSize)];
@@ -1316,11 +1332,16 @@ public partial class MainViewModel : ObservableObject
             using var aes = new System.Security.Cryptography.AesGcm(keyBytes, tagSize);
             aes.Decrypt(nonce, cipherBytes, tag, plainBytes);
 
-            return System.Text.Encoding.UTF8.GetString(plainBytes);
+            plainText = System.Text.Encoding.UTF8.GetString(plainBytes);
+            return true;
         }
-        catch
+        catch (FormatException)
         {
-            return encryptedText; // Return as-is if decryption fails (not encrypted or wrong key)
+            return false;
+        }
+        catch (System.Security.Cryptography.CryptographicException)
+        {
+            return false;
         }
     }
 
