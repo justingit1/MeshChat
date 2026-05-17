@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
@@ -86,13 +87,7 @@ public partial class MainWindow : Window
         _vm.OnNetworkLogToggled += AnimateNetworkLog;
 
         // Also subscribe to property changes to debug
-        _vm.PropertyChanged += (s, e) =>
-        {
-            if (e.PropertyName == "IsNetworkLogVisible")
-            {
-                System.Diagnostics.Debug.WriteLine($"Log visibility changed to: {_vm.IsNetworkLogVisible}");
-            }
-        };
+        _vm.PropertyChanged += Vm_PropertyChanged;
 
         // Set initial state - network log visible for debugging
         Loaded += async (_, _) =>
@@ -115,10 +110,22 @@ public partial class MainWindow : Window
         };
         Closing += (_, _) =>
         {
+            _vm.Messages.CollectionChanged -= Messages_CollectionChanged;
+            _vm.OnNetworkLogToggled -= AnimateNetworkLog;
+            _vm.PropertyChanged -= Vm_PropertyChanged;
+
             _windowCts.Cancel();
             _vm.Stop();
             _windowCts.Dispose();
         };
+    }
+
+    private void Vm_PropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == "IsNetworkLogVisible")
+        {
+            System.Diagnostics.Debug.WriteLine($"Log visibility changed to: {_vm.IsNetworkLogVisible}");
+        }
     }
 
     private async Task PlayStartupAnimationsAsync(CancellationToken cancellationToken)
@@ -149,6 +156,10 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Startup animation failed");
         }
     }
 
