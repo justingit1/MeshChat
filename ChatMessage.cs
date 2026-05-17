@@ -41,6 +41,7 @@ public record ChatMessage
     public double FileProgress { get; init; }
 
     // Mesh routing fields
+    public string? ConversationId { get; init; } // "broadcast" or direct peer ID
     public string? TargetPeerId { get; init; }   // null = broadcast
     public int HopCount { get; init; }
     public string[] VisitedNodes { get; init; } = [];

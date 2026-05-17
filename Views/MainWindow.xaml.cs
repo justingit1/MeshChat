@@ -100,6 +100,9 @@ public partial class MainWindow : Window
 
             try
             {
+                // Load persisted messages before network services can receive new packets.
+                await _vm.InitializeAsync(_windowCts.Token);
+
                 // Start services after window is fully rendered.
                 await _vm.StartAsync(_windowCts.Token);
                 UpdateTitle();
@@ -108,15 +111,25 @@ public partial class MainWindow : Window
             {
             }
         };
-        Closing += (_, _) =>
+        Closing += async (_, _) =>
         {
             _vm.Messages.CollectionChanged -= Messages_CollectionChanged;
             _vm.OnNetworkLogToggled -= AnimateNetworkLog;
             _vm.PropertyChanged -= Vm_PropertyChanged;
 
             _windowCts.Cancel();
-            _vm.Stop();
-            _windowCts.Dispose();
+            try
+            {
+                await _vm.StopAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Shutdown failed");
+            }
+            finally
+            {
+                _windowCts.Dispose();
+            }
         };
     }
 

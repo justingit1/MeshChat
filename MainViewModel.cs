@@ -25,6 +25,8 @@ namespace MeshChat.ViewModels;
 
 public partial class MainViewModel : ObservableObject
 {
+    private const string BroadcastConversationId = "broadcast";
+
     // MainViewModel talks to transports through INetworkService so WiFi and
     // Bluetooth can share send/receive/discovery handling without concrete coupling.
     private readonly INetworkService _wifi;
@@ -261,10 +263,12 @@ public partial class MainViewModel : ObservableObject
     private readonly Dictionary<string, ChatMessage> _messageById = [];
     private readonly Dictionary<string, Dictionary<string, HashSet<string>>> _reactionUsersByMessage = [];
     private readonly SemaphoreSlim _saveLock = new(1, 1);
+    private readonly SemaphoreSlim _initializeLock = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly object _logBatchLock = new();
     private readonly List<LogEntry> _pendingLogEntries = [];
     private int _saveVersion;
+    private bool _persistedMessagesLoaded;
     private bool _logFlushQueued;
     private const int SaveDebounceMs = 500;
     private const int MaxVisibleHistoryMessages = 500;
@@ -338,9 +342,6 @@ public partial class MainViewModel : ObservableObject
 
         DisplayName = Environment.MachineName;
 
-        // Load persisted messages
-        _ = LoadPersistedMessagesAsync(_lifetimeCts.Token);
-
         // The interface exposes the same discovery, receive, and log events for
         // every transport, so both services can be wired to one set of handlers.
         _wifi.PeerDiscovered += OnPeerDiscovered;
@@ -362,6 +363,27 @@ public partial class MainViewModel : ObservableObject
     }
 
     // ─── Startup ────────────────────────────────────────────────────────────
+
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCts.Token, cancellationToken);
+        cancellationToken = linkedCts.Token;
+
+        await _initializeLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_persistedMessagesLoaded)
+                return;
+
+            await LoadPersistedMessagesAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            _persistedMessagesLoaded = true;
+        }
+        finally
+        {
+            _initializeLock.Release();
+        }
+    }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -421,9 +443,16 @@ public partial class MainViewModel : ObservableObject
 
     public void Stop()
     {
+        StopAsync().GetAwaiter().GetResult();
+    }
+
+    public async Task StopAsync()
+    {
+        await SaveMessagesImmediatelyAsync(CancellationToken.None);
+
         _lifetimeCts.Cancel();
-        _wifi.Stop();
-        _bluetooth.Stop();
+        await _wifi.StopAsync();
+        await _bluetooth.StopAsync();
     }
 
     // ─── Manual Connect ─────────────────────────────────────────────────────
@@ -445,9 +474,10 @@ public partial class MainViewModel : ObservableObject
             ShowToast("Select a peer to send message", true);
             return;
         }
+        var selectedPeer = SelectedPeer;
 
         // Determine transport based on selected peer or broadcast
-        string transport = SelectedPeer?.Transport == TransportType.Bluetooth ? "Bluetooth" : "WiFi";
+        string transport = selectedPeer.Transport == TransportType.Bluetooth ? "Bluetooth" : "WiFi";
 
         var msg = new ChatMessage
         {
@@ -456,13 +486,15 @@ public partial class MainViewModel : ObservableObject
             Content = MessageInput,
             Type = MessageType.Text,
             Status = MessageStatus.Sent,
+            ConversationId = selectedPeer.Id,
+            TargetPeerId = selectedPeer.Id,
             Transport = transport
         };
 
         MessageInput = string.Empty;
 
         // Add to local history and always show in current view
-        AddMessageToHistory(SelectedPeer?.Id ?? "broadcast", msg);
+        msg = AddMessageToHistory(selectedPeer.Id, msg);
         Messages.Add(msg);
 
         var jsonPayload = JsonConvert.SerializeObject(msg);
@@ -476,15 +508,15 @@ public partial class MainViewModel : ObservableObject
             Type = PacketType.Message,
             SenderId = _wifi.LocalId,
             SenderName = DisplayName,
-            TargetId = SelectedPeer?.Id,
+            TargetId = selectedPeer.Id,
             Payload = jsonPayload
         };
 
-        if (SelectedPeer != null)
+        if (selectedPeer != null)
         {
-            await SendToPeerViaTransportAsync(SelectedPeer.Id, packet, cancellationToken);
+            await SendToPeerViaTransportAsync(selectedPeer.Id, packet, cancellationToken);
             // Log the send event with visual indicator
-            AddLog($"[SENT \u2191] To: {SelectedPeer.DisplayName} via {transport}", LogLevel.Sent);
+            AddLog($"[SENT \u2191] To: {selectedPeer.DisplayName} via {transport}", LogLevel.Sent);
         }
         else
         {
@@ -508,10 +540,12 @@ public partial class MainViewModel : ObservableObject
             FileSize = fileInfo.Length,
             FilePath = filePath,
             Status = MessageStatus.Sending,
+            ConversationId = SelectedPeer.Id,
+            TargetPeerId = SelectedPeer.Id,
             Transport = SelectedPeer.Transport == TransportType.Bluetooth ? "Bluetooth" : "WiFi"
         };
 
-        AddMessageToHistory(SelectedPeer.Id, msg);
+        msg = AddMessageToHistory(SelectedPeer.Id, msg);
         Messages.Add(msg);
 
         await foreach (var packet in _fileTransfer.ChunkFileAsync(
@@ -542,6 +576,7 @@ public partial class MainViewModel : ObservableObject
                 var sysMsg = new ChatMessage
                 {
                     Type = MessageType.System,
+                    ConversationId = peer.Id,
                     Content = $"{peer.DisplayName} joined the network"
                 };
                 AddMessageToHistory(peer.Id, sysMsg);
@@ -564,22 +599,28 @@ public partial class MainViewModel : ObservableObject
     {
         _dispatcher.Invoke(() =>
         {
-            if (_peerById.TryGetValue(peerId, out var peer))
-            {
-                ReplacePeer(peer, peer with { Status = PeerStatus.Offline });
-                AddLog($"Peer left: {peer.DisplayName}");
-
-                var sysMsg = new ChatMessage
-                {
-                    Type = MessageType.System,
-                    Content = $"{peer.DisplayName} left the network"
-                };
-                AddMessageToHistory(peerId, sysMsg);
-
-                if (SelectedPeer?.Id == peerId)
-                    Messages.Add(sysMsg);
-            }
+            MarkPeerOffline(peerId);
         });
+    }
+
+    private void MarkPeerOffline(string peerId)
+    {
+        if (_peerById.TryGetValue(peerId, out var peer))
+        {
+            ReplacePeer(peer, peer with { Status = PeerStatus.Offline });
+            AddLog($"Peer left: {peer.DisplayName}");
+
+            var sysMsg = new ChatMessage
+            {
+                Type = MessageType.System,
+                ConversationId = peerId,
+                Content = $"{peer.DisplayName} left the network"
+            };
+            sysMsg = AddMessageToHistory(peerId, sysMsg);
+
+            if (SelectedPeer?.Id == peerId)
+                Messages.Add(sysMsg);
+        }
     }
 
     private void OnPacketReceived(NetworkPacket packet)
@@ -604,6 +645,26 @@ public partial class MainViewModel : ObservableObject
                     _fileTransfer.HandleChunk(packet);
                     break;
 
+                case PacketType.FileComplete:
+                    // FileTransferService completes incoming files by received chunk count.
+                    AddLog($"Ignored FileComplete from {packet.SenderName ?? packet.SenderId}: chunks drive completion", LogLevel.FileTransfer);
+                    break;
+
+                case PacketType.PeerList:
+                    // Peer list merging is intentionally deferred; direct discovery owns peers today.
+                    AddLog($"Ignored PeerList from {packet.SenderName ?? packet.SenderId}: mesh peer merge is unsupported", LogLevel.Info);
+                    break;
+
+                case PacketType.Goodbye:
+                    if (string.IsNullOrWhiteSpace(packet.SenderId))
+                    {
+                        AddLog("Ignored Goodbye packet without sender id", LogLevel.Warning);
+                        break;
+                    }
+
+                    MarkPeerOffline(packet.SenderId);
+                    break;
+
                 case PacketType.Typing:
                     // Show typing indicator for the peer
                     if (packet.SenderId != _wifi.LocalId)
@@ -614,6 +675,15 @@ public partial class MainViewModel : ObservableObject
 
                 case PacketType.Reaction:
                     HandleIncomingReaction(packet);
+                    break;
+
+                case PacketType.Hello:
+                case PacketType.HelloAck:
+                    // Transport services handle handshake packets before application delivery.
+                    break;
+
+                default:
+                    AddLog($"Ignored unsupported packet type: {packet.Type}", LogLevel.Warning);
                     break;
             }
         });
@@ -647,13 +717,20 @@ public partial class MainViewModel : ObservableObject
 
         if (msg == null) return;
 
-        msg = msg with { Status = MessageStatus.Delivered };
+        var isBroadcast = string.IsNullOrWhiteSpace(packet.TargetId);
+        var conversationId = isBroadcast ? BroadcastConversationId : packet.SenderId;
+        msg = msg with
+        {
+            Status = MessageStatus.Delivered,
+            ConversationId = conversationId,
+            TargetPeerId = packet.TargetId
+        };
 
         var peerId = packet.SenderId;
-        AddMessageToHistory(peerId, msg);
+        msg = AddMessageToHistory(conversationId, msg);
 
         // Show message if viewing this peer OR in broadcast view (no peer selected)
-        bool isViewingThisPeer = SelectedPeer?.Id == peerId;
+        bool isViewingThisPeer = !isBroadcast && SelectedPeer?.Id == peerId;
         bool isInBroadcastView = SelectedPeer == null;
 
         if (isViewingThisPeer || isInBroadcastView)
@@ -673,7 +750,7 @@ public partial class MainViewModel : ObservableObject
                 await SendToPeerViaTransportAsync(peerId, ack, cancellationToken);
             }
         }
-        else
+        else if (!isBroadcast)
         {
             // Viewing a different peer — increment unread badge
             if (_peerById.TryGetValue(peerId, out var peer))
@@ -823,13 +900,44 @@ public partial class MainViewModel : ObservableObject
 
     // ─── Helpers ────────────────────────────────────────────────────────────
 
-    private void AddMessageToHistory(string peerId, ChatMessage msg)
+    private ChatMessage AddMessageToHistory(string conversationId, ChatMessage msg)
     {
-        if (!_messageHistory.TryGetValue(peerId, out var history))
-            _messageHistory[peerId] = history = [];
+        msg = EnsureConversationId(msg, conversationId);
+
+        if (!_messageHistory.TryGetValue(conversationId, out var history))
+            _messageHistory[conversationId] = history = [];
         history.Add(msg);
         IndexMessage(msg);
         _ = SaveMessagesAsync(_lifetimeCts.Token);
+        return msg;
+    }
+
+    private static ChatMessage EnsureConversationId(ChatMessage msg, string conversationId)
+        => string.Equals(msg.ConversationId, conversationId, StringComparison.Ordinal)
+            ? msg
+            : msg with { ConversationId = conversationId };
+
+    private string ResolveConversationId(ChatMessage msg)
+    {
+        if (!string.IsNullOrWhiteSpace(msg.ConversationId))
+            return msg.ConversationId;
+
+        if (!string.IsNullOrWhiteSpace(msg.TargetPeerId))
+        {
+            if (msg.TargetPeerId == _wifi.LocalId &&
+                !string.IsNullOrWhiteSpace(msg.SenderId) &&
+                msg.SenderId != _wifi.LocalId)
+            {
+                return msg.SenderId;
+            }
+
+            return msg.TargetPeerId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(msg.SenderId) && msg.SenderId != _wifi.LocalId)
+            return msg.SenderId;
+
+        return BroadcastConversationId;
     }
 
     private ChatMessage ReplaceMessage(ChatMessage current, ChatMessage updated)
@@ -880,12 +988,13 @@ public partial class MainViewModel : ObservableObject
             var messages = await Task.Run(() => _messageStore.Load(), cancellationToken);
             foreach (var msg in messages)
             {
-                // For simplicity, store all messages under "broadcast" key
-                // A more sophisticated approach would track recipient per message
-                if (!_messageHistory.TryGetValue("broadcast", out var broadcast))
-                    _messageHistory["broadcast"] = broadcast = [];
-                broadcast.Add(msg);
-                IndexMessage(msg);
+                var conversationId = ResolveConversationId(msg);
+                var persistedMessage = EnsureConversationId(msg, conversationId);
+
+                if (!_messageHistory.TryGetValue(conversationId, out var history))
+                    _messageHistory[conversationId] = history = [];
+                history.Add(persistedMessage);
+                IndexMessage(persistedMessage);
             }
             _logger.LogInformation("Loaded {MessageCount} persisted messages", messages.Count);
         }
@@ -913,6 +1022,38 @@ public partial class MainViewModel : ObservableObject
             await _saveLock.WaitAsync(cancellationToken);
             try
             {
+                if (saveVersion != Volatile.Read(ref _saveVersion))
+                    return;
+
+                await Task.Run(() => _messageStore.Save(allMessages), cancellationToken);
+            }
+            finally
+            {
+                _saveLock.Release();
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save messages");
+        }
+    }
+
+    private async Task SaveMessagesImmediatelyAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var saveVersion = Interlocked.Increment(ref _saveVersion);
+            var allMessages = _messageHistory.Values.SelectMany(m => m).ToList();
+
+            await _saveLock.WaitAsync(cancellationToken);
+            try
+            {
+                if (saveVersion != Volatile.Read(ref _saveVersion))
+                    return;
+
                 await Task.Run(() => _messageStore.Save(allMessages), cancellationToken);
             }
             finally
