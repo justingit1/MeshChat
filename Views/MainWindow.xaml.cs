@@ -136,23 +136,19 @@ public partial class MainWindow : Window
             await Task.Delay(50, cancellationToken);
 
             // Fade in the entire window
-            var windowFadeIn = (Storyboard)Resources["WindowFadeIn"];
-            windowFadeIn.Begin(this);
+            TryBeginStoryboard("WindowFadeIn", this);
 
             // Slide down the header
             await Task.Delay(100, cancellationToken);
-            var headerStoryboard = (Storyboard)Resources["HeaderSlideIn"];
-            headerStoryboard.Begin(HeaderBorder);
+            TryBeginStoryboard("HeaderSlideIn", HeaderBorder);
 
             // Slide in the sidebar
             await Task.Delay(120, cancellationToken);
-            var sidebarStoryboard = (Storyboard)Resources["SidebarSlideIn"];
-            sidebarStoryboard.Begin(SidebarBorder);
+            TryBeginStoryboard("SidebarSlideIn", SidebarBorder);
 
             // Fade in the chat area
             await Task.Delay(150, cancellationToken);
-            var chatStoryboard = (Storyboard)Resources["ChatAreaFadeIn"];
-            chatStoryboard.Begin(MainContentGrid);
+            TryBeginStoryboard("ChatAreaFadeIn", MainContentGrid);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -161,6 +157,28 @@ public partial class MainWindow : Window
         {
             _logger.LogError(ex, "Startup animation failed");
         }
+    }
+
+    private bool TryGetStoryboard(string key, out Storyboard storyboard)
+    {
+        if (TryFindResource(key) is Storyboard foundStoryboard)
+        {
+            storyboard = foundStoryboard;
+            return true;
+        }
+
+        storyboard = null!;
+        _logger.LogWarning("Storyboard resource '{ResourceKey}' is missing or not a Storyboard; skipping animation", key);
+        return false;
+    }
+
+    private bool TryBeginStoryboard(string key, FrameworkElement target)
+    {
+        if (!TryGetStoryboard(key, out var storyboard))
+            return false;
+
+        storyboard.Begin(target);
+        return true;
     }
 
     private void AnimateNetworkLog(bool show)
@@ -234,10 +252,12 @@ public partial class MainWindow : Window
     private void AddDeviceButton_Click(object sender, RoutedEventArgs e)
     {
         // Animate button press
-        var pressAnim = (Storyboard)Resources["ButtonPressAnim"];
-        var releaseAnim = (Storyboard)Resources["ButtonReleaseAnim"];
-        pressAnim.Begin(PlusButtonBorder);
-        pressAnim.Completed += (_, _) => releaseAnim.Begin(PlusButtonBorder);
+        if (TryGetStoryboard("ButtonPressAnim", out var pressAnim) &&
+            TryGetStoryboard("ButtonReleaseAnim", out var releaseAnim))
+        {
+            pressAnim.Begin(PlusButtonBorder);
+            pressAnim.Completed += (_, _) => releaseAnim.Begin(PlusButtonBorder);
+        }
 
         // Toggle panel with fade animation
         bool isVisible = ManualConnectPanel.Visibility == Visibility.Visible;

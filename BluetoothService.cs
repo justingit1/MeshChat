@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using InTheHand.Net;
 using InTheHand.Net.Sockets;
 using InTheHand.Net.Bluetooth;
 using MeshChat.Models;
@@ -27,6 +28,9 @@ public class BluetoothService : INetworkService
     private readonly ConcurrentDictionary<string, BluetoothClient> _connections = new();
     private readonly ConcurrentDictionary<string, byte> _seenPacketIds = new();
     private readonly ConcurrentQueue<string> _seenPacketOrder = new();
+    private readonly ConcurrentDictionary<Task, byte> _clientTasks = new();
+    private Task? _acceptTask;
+    private Task? _discoveryTask;
 
     public string LocalName { get; set; } = Environment.MachineName;
     public string LocalId { get; set; } = string.Empty;
@@ -44,26 +48,28 @@ public class BluetoothService : INetworkService
         _logger = logger ?? NullLogger<BluetoothService>.Instance;
     }
 
-    public Task StartAsync(CancellationToken cancellationToken = default)
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         try
         {
             // Check whether a Bluetooth radio is present before doing anything
-            // Use Task.Run with timeout to prevent hanging on systems without BT
+            // Use Task.Run with timeout to prevent hanging on systems without BT.
             var radioTask = Task.Run(() => BluetoothRadio.Default, cancellationToken);
-            if (!radioTask.Wait(TimeSpan.FromSeconds(3), cancellationToken))
+            _ = ObserveBackgroundTask(radioTask, "Bluetooth radio check");
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(3));
+            if (await Task.WhenAny(radioTask, timeoutTask) != radioTask)
             {
-                Log("Bluetooth check timed out — disabling BT");
+                Log("Bluetooth check timed out - disabling BT");
                 IsAvailable = false;
-                return Task.CompletedTask;
+                return;
             }
 
-            var radio = radioTask.Result;
+            var radio = await radioTask;
             if (radio == null)
             {
-                Log("No Bluetooth radio found — Bluetooth disabled.");
+                Log("No Bluetooth radio found - Bluetooth disabled.");
                 IsAvailable = false;
-                return Task.CompletedTask;
+                return;
             }
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -75,14 +81,14 @@ public class BluetoothService : INetworkService
             Log("Bluetooth listener started");
 
             // Start accepting incoming connections
-            _ = AcceptConnectionsAsync(_cts.Token);
+            _acceptTask = ObserveBackgroundTask(AcceptConnectionsAsync(_cts.Token), "Bluetooth accept loop");
 
             // Start device discovery after a short delay to not block startup
-            _ = Task.Run(async () =>
+            _discoveryTask = ObserveBackgroundTask(Task.Run(async () =>
             {
                 await Task.Delay(2000, _cts.Token); // Wait for app to fully start
                 await DiscoveryLoop(_cts.Token);
-            }, _cts.Token);
+            }, _cts.Token), "Bluetooth discovery loop");
         }
         catch (OperationCanceledException)
         {
@@ -93,13 +99,18 @@ public class BluetoothService : INetworkService
             LogWarning(ex, "BT Error: {Message}", ex.Message);
             IsAvailable = false;
         }
-        return Task.CompletedTask;
     }
 
     public void Stop()
     {
+        StopAsync().GetAwaiter().GetResult();
+    }
+
+    public async Task StopAsync()
+    {
         _running = false;
         _cts.Cancel();
+        IsRunning = false;
         try { _listener?.Stop(); } catch (Exception ex) { _logger.LogError(ex, "Bluetooth stop error"); }
 
         foreach (var conn in _connections.Values)
@@ -107,7 +118,7 @@ public class BluetoothService : INetworkService
             try { conn.Close(); } catch (Exception ex) { _logger.LogError(ex, "Bluetooth conn close error"); }
         }
         _connections.Clear();
-        IsRunning = false;
+        await WaitForBackgroundTasksAsync();
     }
 
     private async Task AcceptConnectionsAsync(CancellationToken ct)
@@ -116,10 +127,11 @@ public class BluetoothService : INetworkService
         {
             try
             {
-                var client = _listener!.AcceptBluetoothClient();
-                _ = HandleClientAsync(client, ct);
+                var client = await Task.Run(() => _listener!.AcceptBluetoothClient(), ct);
+                TrackClientTask(HandleClientAsync(client, ct));
             }
             catch (OperationCanceledException) { break; }
+            catch (Exception ex) when (IsExpectedShutdown(ex, ct)) { break; }
             catch (Exception ex)
             {
                 LogWarning(ex, "BT accept error: {Message}", ex.Message);
@@ -156,6 +168,7 @@ public class BluetoothService : INetworkService
                 // Register peer on Hello
                 if (packet.Type == PacketType.Hello)
                 {
+                    if (!IsRunning || ct.IsCancellationRequested) continue;
                     peerId = packet.SenderId;
                     peerName = packet.SenderName;
                     _connections[peerId] = client;
@@ -183,6 +196,7 @@ public class BluetoothService : INetworkService
                 // Register peer on HelloAck
                 if (packet.Type == PacketType.HelloAck && peerId == null)
                 {
+                    if (!IsRunning || ct.IsCancellationRequested) continue;
                     peerId = packet.SenderId;
                     peerName = packet.SenderName;
                     _connections[peerId] = client;
@@ -203,16 +217,15 @@ public class BluetoothService : INetworkService
                 // Relay if needed
                 if (packet.Ttl > 1 && packet.TargetId != LocalId && packet.TargetId != null)
                 {
-                    packet.Ttl--;
-                    var visited = packet.VisitedNodes.ToList();
-                    visited.Add(LocalId);
-                    packet.VisitedNodes = visited.ToArray();
-                    await RelayPacketAsync(packet, ct);
+                    await RelayPacketAsync(CreateRelayPacket(packet), ct);
                 }
 
-                PacketReceived?.Invoke(packet);
+                if (ShouldDeliverToApplication(packet) && IsRunning && !ct.IsCancellationRequested)
+                    PacketReceived?.Invoke(packet);
             }
         }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) when (IsExpectedShutdown(ex, ct)) { }
         catch (Exception ex)
         {
             LogWarning(ex, "BT client error: {Message}", ex.Message);
@@ -222,7 +235,8 @@ public class BluetoothService : INetworkService
             if (peerId != null)
             {
                 _connections.TryRemove(peerId, out _);
-                PeerLost?.Invoke(peerId);
+                if (IsRunning && !ct.IsCancellationRequested)
+                    PeerLost?.Invoke(peerId);
             }
             client.Dispose();
         }
@@ -235,6 +249,30 @@ public class BluetoothService : INetworkService
             .Select(kvp => SendPacketToClientAsync(kvp.Value, packet, cancellationToken));
         await Task.WhenAll(tasks);
     }
+
+    private NetworkPacket CreateRelayPacket(NetworkPacket packet)
+    {
+        var visited = packet.VisitedNodes.ToList();
+        visited.Add(LocalId);
+
+        return new NetworkPacket
+        {
+            Id = packet.Id,
+            Type = packet.Type,
+            SenderId = packet.SenderId,
+            SenderName = packet.SenderName,
+            TargetId = packet.TargetId,
+            Ttl = packet.Ttl - 1,
+            VisitedNodes = visited.ToArray(),
+            CreatedAt = packet.CreatedAt,
+            Payload = packet.Payload,
+            TcpPort = packet.TcpPort,
+            KnownPeers = packet.KnownPeers
+        };
+    }
+
+    private bool ShouldDeliverToApplication(NetworkPacket packet)
+        => packet.TargetId == null || packet.TargetId == LocalId;
 
     private bool MarkPacketSeen(string packetId)
     {
@@ -286,13 +324,54 @@ public class BluetoothService : INetworkService
         }
     }
 
-    public Task ConnectToPeerAsync(string address, int? port = null, CancellationToken cancellationToken = default)
+    public async Task ConnectToPeerAsync(string address, int? port = null, CancellationToken cancellationToken = default)
     {
-        // Note: Direct Bluetooth connections require pairing first
-        // The device will be discovered automatically via DiscoveryLoop
-        // This method triggers an immediate discovery to find the device
-        Log($"Bluetooth connect requested for {address} - device should appear via discovery");
-        return Task.CompletedTask;
+        BluetoothClient? client = null;
+
+        try
+        {
+            if (!IsAvailable || !IsRunning)
+            {
+                Log($"Bluetooth connect skipped for {address}: Bluetooth is not available");
+                return;
+            }
+
+            if (!BluetoothAddress.TryParse(address, out var bluetoothAddress))
+            {
+                Log($"Bluetooth connect failed: invalid address {address}");
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            client = new BluetoothClient();
+            await client.ConnectAsync(bluetoothAddress, _serviceGuid).WaitAsync(cancellationToken);
+            Log($"Connected to Bluetooth peer {address}");
+
+            TrackClientTask(HandleClientAsync(client, _cts.Token));
+
+            await SendPacketToClientAsync(client, new NetworkPacket
+            {
+                Type = PacketType.Hello,
+                SenderId = LocalId,
+                SenderName = LocalName
+            }, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            client = null;
+        }
+        catch (OperationCanceledException)
+        {
+            Log($"Bluetooth connect cancelled for {address}");
+        }
+        catch (Exception ex)
+        {
+            LogWarning(ex, "BT connect failed for {Address}: {Message}", address, ex.Message);
+        }
+        finally
+        {
+            client?.Dispose();
+        }
     }
 
     private async Task DiscoveryLoop(CancellationToken cancellationToken)
@@ -324,31 +403,19 @@ public class BluetoothService : INetworkService
                     Log($"Found {devices.Count} Bluetooth device(s)");
                 }
 
-                foreach (var device in devices)
-                {
-                    var address = device.DeviceAddress.ToString();
-
-                    // Only announce discovery if we don't already have a connection
-                    if (!_connections.ContainsKey(address))
-                    {
-                        PeerDiscovered?.Invoke(new Peer
-                        {
-                            Id = address,
-                            DisplayName = device.DeviceName,
-                            Status = PeerStatus.Online,
-                            Transport = MeshChat.Models.TransportType.Bluetooth,
-                            BluetoothAddress = address,
-                            HopsAway = 1
-                        });
-                    }
-                }
             }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) when (IsExpectedShutdown(ex, cancellationToken)) { break; }
             catch (Exception ex)
             {
                 LogWarning(ex, "BT discovery error: {Message}", ex.Message);
             }
 
-            await Task.Delay(10000, cancellationToken);
+            try
+            {
+                await Task.Delay(10000, cancellationToken);
+            }
+            catch (OperationCanceledException) { break; }
         }
     }
 
@@ -362,6 +429,58 @@ public class BluetoothService : INetworkService
     {
         _logger.LogWarning(exception, message, args);
         LogMessage?.Invoke($"[{TransportName}] {FormatLogMessage(message, args)}");
+    }
+
+    private Task ObserveBackgroundTask(Task task, string operation)
+    {
+        _ = task.ContinueWith(
+            t => _logger.LogError(t.Exception, "{Operation} failed", operation),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
+        return task;
+    }
+
+    private void TrackClientTask(Task task)
+    {
+        _clientTasks.TryAdd(task, 0);
+        _ = ObserveBackgroundTask(task, "Bluetooth client handler").ContinueWith(
+            t => _clientTasks.TryRemove(t, out _),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private async Task WaitForBackgroundTasksAsync()
+    {
+        var tasks = new[] { _acceptTask, _discoveryTask }
+            .Where(task => task != null)
+            .Cast<Task>()
+            .Concat(_clientTasks.Keys)
+            .ToArray();
+
+        if (tasks.Length == 0) return;
+
+        try
+        {
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        catch (TimeoutException ex)
+        {
+            _logger.LogWarning(ex, "Timed out waiting for Bluetooth background tasks to stop");
+        }
+        catch (Exception ex) when (IsExpectedShutdown(ex, _cts.Token)) { }
+    }
+
+    private static bool IsExpectedShutdown(Exception exception, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return exception is OperationCanceledException
+                or ObjectDisposedException
+                or IOException
+                or InvalidOperationException;
+
+        return false;
     }
 
     private static string FormatLogMessage(string template, object?[] args)
