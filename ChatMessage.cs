@@ -49,6 +49,11 @@ public record ChatMessage
     // Transport info
     public string Transport { get; init; } = "WiFi";  // "WiFi" or "Bluetooth"
 
+    // Outgoing text queue metadata
+    public DateTime? QueuedAt { get; init; }
+    public int QueueRetryCount { get; init; }
+    public DateTime? LastQueueAttemptAt { get; init; }
+
     // Message reactions (emoji -> list of user IDs)
     public Dictionary<string, List<string>> Reactions { get; init; } = [];
 }

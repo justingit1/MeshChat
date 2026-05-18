@@ -262,6 +262,10 @@ public partial class MainViewModel : ObservableObject
     private readonly Dictionary<string, Peer> _peerById = [];
     private readonly Dictionary<string, ChatMessage> _messageById = [];
     private readonly Dictionary<string, Dictionary<string, HashSet<string>>> _reactionUsersByMessage = [];
+    private readonly Dictionary<string, CancellationTokenSource> _ackRetryCancellations = [];
+    private readonly HashSet<string> _queuedSendInFlight = [];
+    private readonly object _ackRetryLock = new();
+    private readonly object _queuedSendLock = new();
     private readonly SemaphoreSlim _saveLock = new(1, 1);
     private readonly SemaphoreSlim _initializeLock = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts = new();
@@ -273,6 +277,9 @@ public partial class MainViewModel : ObservableObject
     private const int SaveDebounceMs = 500;
     private const int MaxVisibleHistoryMessages = 500;
     private const int MaxVisibleLogs = 200;
+    private const int AckRetryTimeoutMs = 250;
+    private const int MaxAckRetries = 2;
+    private const int MaxQueuedSendAttempts = 3;
 
     // ─── Transport Routing Helpers ──────────────────────────────────────────
 
@@ -284,6 +291,9 @@ public partial class MainViewModel : ObservableObject
             await _wifi.SendToPeerAsync(peerId, packet, cancellationToken);
             return true;
         }
+
+        if (peer.Status == PeerStatus.Offline)
+            return false;
 
         var sendPeerId = peerId;
 
@@ -319,6 +329,274 @@ public partial class MainViewModel : ObservableObject
     }
 
     // ─── Constructor ────────────────────────────────────────────────────────
+
+    private void TrackAckRetry(string peerId, ChatMessage msg, bool isEncrypted, string peerDisplayName)
+    {
+        if (_lifetimeCts.IsCancellationRequested)
+            return;
+
+        var retryCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCts.Token);
+
+        lock (_ackRetryLock)
+        {
+            CancelAckRetryLocked(msg.Id);
+            _ackRetryCancellations[msg.Id] = retryCts;
+        }
+
+        _ = RetryUntilAckAsync(peerId, msg, isEncrypted, peerDisplayName, retryCts.Token);
+    }
+
+    private async Task RetryUntilAckAsync(
+        string peerId,
+        ChatMessage msg,
+        bool isEncrypted,
+        string peerDisplayName,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            for (var attempt = 1; attempt <= MaxAckRetries; attempt++)
+            {
+                await Task.Delay(AckRetryTimeoutMs, cancellationToken);
+
+                if (!ShouldRetryForAck(msg.Id))
+                    return;
+
+                var packet = CreateRetryPacket(peerId, msg, isEncrypted);
+                if (!await SendToPeerViaTransportAsync(peerId, packet, cancellationToken))
+                {
+                    QueueMessageAfterAckRetries(msg.Id, $"No route to {peerDisplayName}");
+                    return;
+                }
+
+                AddLog($"[RETRY {attempt}/{MaxAckRetries}] To: {peerDisplayName}", LogLevel.Warning);
+            }
+
+            await Task.Delay(AckRetryTimeoutMs, cancellationToken);
+
+            if (ShouldRetryForAck(msg.Id))
+                QueueMessageAfterAckRetries(msg.Id, $"No delivery acknowledgement from {peerDisplayName}");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ACK retry failed for message {MessageId}", msg.Id);
+            QueueMessageAfterAckRetries(msg.Id, $"Retry failed for {peerDisplayName}: {ex.Message}");
+        }
+        finally
+        {
+            RemoveAckRetry(msg.Id);
+        }
+    }
+
+    private NetworkPacket CreateRetryPacket(string peerId, ChatMessage msg, bool isEncrypted)
+    {
+        var payload = JsonConvert.SerializeObject(msg);
+        if (isEncrypted)
+            payload = Encrypt(payload);
+
+        return new NetworkPacket
+        {
+            Type = PacketType.Message,
+            SenderId = _wifi.LocalId,
+            SenderName = DisplayName,
+            TargetId = peerId,
+            Payload = payload,
+            IsEncrypted = isEncrypted,
+            CryptoVersion = isEncrypted ? CryptoVersionAesGcm1 : null
+        };
+    }
+
+    private bool ShouldRetryForAck(string messageId)
+    {
+        if (!_messageById.TryGetValue(messageId, out var current))
+            return false;
+
+        return current.Status is MessageStatus.Sending or MessageStatus.Sent;
+    }
+
+    private void QueueMessageAfterAckRetries(string messageId, string reason)
+    {
+        InvokeOnUiThread(() =>
+        {
+            if (!_messageById.TryGetValue(messageId, out var current) || !ShouldRetryForAck(messageId))
+                return;
+
+            QueueOutgoingTextMessage(current, reason);
+        });
+    }
+
+    private ChatMessage QueueOutgoingTextMessage(ChatMessage msg, string reason)
+    {
+        var queued = msg with
+        {
+            Status = MessageStatus.Failed,
+            QueuedAt = msg.QueuedAt ?? DateTime.UtcNow
+        };
+
+        queued = ReplaceMessage(msg, queued);
+        ShowToast(reason, true);
+        AddLog($"[QUEUED] {reason}", LogLevel.Warning);
+        return queued;
+    }
+
+    private bool IsQueuedOutgoingTextMessage(ChatMessage msg)
+        => msg.Type == MessageType.Text &&
+           msg.QueuedAt != null &&
+           msg.Status is not (MessageStatus.Delivered or MessageStatus.Read) &&
+           msg.SenderId == _wifi.LocalId &&
+           !string.IsNullOrWhiteSpace(msg.TargetPeerId);
+
+    private void TryResendQueuedTextMessages()
+    {
+        var queuedMessages = _messageHistory.Values
+            .SelectMany(history => history)
+            .Where(IsQueuedOutgoingTextMessage)
+            .ToList();
+
+        foreach (var msg in queuedMessages)
+            _ = TryResendQueuedTextMessageAsync(msg.Id, _lifetimeCts.Token);
+    }
+
+    private async Task TryResendQueuedTextMessageAsync(string messageId, CancellationToken cancellationToken)
+    {
+        lock (_queuedSendLock)
+        {
+            if (!_queuedSendInFlight.Add(messageId))
+                return;
+        }
+
+        try
+        {
+            ChatMessage msg;
+            string peerId;
+            string peerDisplayName;
+            bool isEncrypted;
+
+            if (!_messageById.TryGetValue(messageId, out msg!) || !IsQueuedOutgoingTextMessage(msg))
+                return;
+
+            if (msg.QueueRetryCount >= MaxQueuedSendAttempts)
+            {
+                AddLog($"[QUEUED] Retry limit reached for message {messageId}", LogLevel.Warning);
+                return;
+            }
+
+            peerId = msg.TargetPeerId!;
+            if (!HasAvailableMessageRoute(peerId))
+                return;
+
+            peerDisplayName = _peerById.TryGetValue(peerId, out var peer)
+                ? peer.DisplayName
+                : peerId;
+            isEncrypted = EncryptionEnabled;
+
+            var attempting = ReplaceMessage(msg, msg with
+            {
+                Status = MessageStatus.Sending,
+                QueueRetryCount = msg.QueueRetryCount + 1,
+                LastQueueAttemptAt = DateTime.UtcNow
+            });
+
+            var packet = CreateRetryPacket(peerId, attempting, isEncrypted);
+
+            try
+            {
+                if (await SendToPeerViaTransportAsync(peerId, packet, cancellationToken))
+                {
+                    var sent = ReplaceMessage(attempting, attempting with
+                    {
+                        Status = MessageStatus.Sent,
+                        QueuedAt = null
+                    });
+                    TrackAckRetry(peerId, sent, isEncrypted, peerDisplayName);
+                    AddLog($"[RESENT] To: {peerDisplayName}", LogLevel.Sent);
+                    return;
+                }
+
+                QueueOutgoingTextMessage(attempting, $"No route to {peerDisplayName}");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                QueueOutgoingTextMessage(attempting, $"Failed to send to {peerDisplayName}: {ex.Message}");
+                _logger.LogError(ex, "Failed to resend queued message {MessageId} to {PeerId}", attempting.Id, peerId);
+            }
+        }
+        finally
+        {
+            lock (_queuedSendLock)
+            {
+                _queuedSendInFlight.Remove(messageId);
+            }
+        }
+    }
+
+    private bool HasAvailableMessageRoute(string peerId)
+    {
+        if (!_peerById.TryGetValue(peerId, out var peer) || peer.Status == PeerStatus.Offline)
+            return false;
+
+        if (peer.IsDirectlyConnected)
+            return true;
+
+        return !string.IsNullOrWhiteSpace(peer.RelayPeerId) &&
+               _peerById.TryGetValue(peer.RelayPeerId, out var relayPeer) &&
+               relayPeer.IsDirectlyConnected &&
+               relayPeer.Status != PeerStatus.Offline;
+    }
+
+    private void InvokeOnUiThread(Action action)
+    {
+        if (_dispatcher.CheckAccess() || Application.Current == null)
+            action();
+        else
+            _dispatcher.Invoke(action);
+    }
+
+    private void CancelAckRetry(string messageId)
+    {
+        lock (_ackRetryLock)
+        {
+            CancelAckRetryLocked(messageId);
+        }
+    }
+
+    private void CancelAckRetryLocked(string messageId)
+    {
+        if (_ackRetryCancellations.Remove(messageId, out var cts))
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+    }
+
+    private void CancelAllAckRetries()
+    {
+        lock (_ackRetryLock)
+        {
+            foreach (var cts in _ackRetryCancellations.Values)
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
+
+            _ackRetryCancellations.Clear();
+        }
+    }
+
+    private void RemoveAckRetry(string messageId)
+    {
+        lock (_ackRetryLock)
+        {
+            if (_ackRetryCancellations.TryGetValue(messageId, out var cts) &&
+                cts.IsCancellationRequested)
+            {
+                _ackRetryCancellations.Remove(messageId);
+            }
+        }
+    }
 
     public MainViewModel()
         : this(
@@ -459,6 +737,7 @@ public partial class MainViewModel : ObservableObject
         AddLog("- Peers auto-discover via mDNS/Bonjour", LogLevel.Info);
         AddLog("- Use manual connect for IP addresses", LogLevel.Info);
         AddLog("- Files transfer in 32KB chunks", LogLevel.Info);
+        TryResendQueuedTextMessages();
     }
 
     public void Stop()
@@ -471,6 +750,7 @@ public partial class MainViewModel : ObservableObject
         await SaveMessagesImmediatelyAsync(CancellationToken.None);
 
         _lifetimeCts.Cancel();
+        CancelAllAckRetries();
         await _wifi.StopAsync();
         await _bluetooth.StopAsync();
     }
@@ -552,22 +832,19 @@ public partial class MainViewModel : ObservableObject
             if (await SendToPeerViaTransportAsync(selectedPeer.Id, packet, cancellationToken))
             {
                 msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
+                TrackAckRetry(selectedPeer.Id, msg, isEncrypted, selectedPeer.DisplayName);
 
                 // Log the send event with visual indicator
                 AddLog($"[SENT \u2191] To: {selectedPeer.DisplayName} via {transport}", LogLevel.Sent);
             }
             else
             {
-                msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Failed });
-                ShowToast($"No route to {selectedPeer.DisplayName}", true);
-                AddLog($"[FAILED] No route to {selectedPeer.DisplayName}", LogLevel.Warning);
+                msg = QueueOutgoingTextMessage(msg, $"No route to {selectedPeer.DisplayName}");
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Failed });
-            ShowToast($"Failed to send to {selectedPeer.DisplayName}: {ex.Message}", true);
-            AddLog($"[FAILED] Send to {selectedPeer.DisplayName} failed: {ex.Message}", LogLevel.Error);
+            msg = QueueOutgoingTextMessage(msg, $"Failed to send to {selectedPeer.DisplayName}: {ex.Message}");
             _logger.LogError(ex, "Failed to send message {MessageId} to {PeerId}", msg.Id, selectedPeer.Id);
         }
     }
@@ -646,6 +923,7 @@ public partial class MainViewModel : ObservableObject
                 if (shouldPromoteToDirect)
                 {
                     SendPeerListToPeer(peer);
+                    TryResendQueuedTextMessages();
                     return;
                 }
                 // Update transport if it changed (e.g. WiFi → Both)
@@ -655,6 +933,8 @@ public partial class MainViewModel : ObservableObject
 
             if (peer.IsDirectlyConnected)
                 SendPeerListToPeer(peer);
+
+            TryResendQueuedTextMessages();
         });
     }
 
@@ -811,7 +1091,10 @@ public partial class MainViewModel : ObservableObject
         }
 
         if (added > 0 || updated > 0)
+        {
             AddLog($"Merged PeerList from {relayPeer.DisplayName}: {added} discovered, {updated} updated", LogLevel.Info);
+            TryResendQueuedTextMessages();
+        }
     }
 
     private async Task HandleIncomingMessageAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
@@ -1147,6 +1430,8 @@ public partial class MainViewModel : ObservableObject
 
         _messageById[updated.Id] = updated;
         IndexReactions(updated);
+        if (updated.Status is MessageStatus.Delivered or MessageStatus.Read or MessageStatus.Failed)
+            CancelAckRetry(updated.Id);
         _ = SaveMessagesAsync(_lifetimeCts.Token);
         return updated;
     }
@@ -1154,7 +1439,11 @@ public partial class MainViewModel : ObservableObject
     private ChatMessage MarkMessageStatusAtLeast(ChatMessage msg, MessageStatus status)
         => GetMessageStatusRank(msg.Status) >= GetMessageStatusRank(status)
             ? msg
-            : ReplaceMessage(msg, msg with { Status = status });
+            : ReplaceMessage(msg, msg with
+            {
+                Status = status,
+                QueuedAt = status is MessageStatus.Delivered or MessageStatus.Read ? null : msg.QueuedAt
+            });
 
     private static int GetMessageStatusRank(MessageStatus status) => status switch
     {
