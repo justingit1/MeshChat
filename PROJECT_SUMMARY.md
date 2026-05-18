@@ -5,24 +5,25 @@
 2. [Core Features](#core-features)
 3. [Technical Architecture](#technical-architecture)
 4. [Network Protocol](#network-protocol)
-5. [User Interface](#user-interface)
-6. [Data Models](#data-models)
-7. [Services](#services)
-8. [Build Configuration](#build-configuration)
-9. [Use Cases](#use-cases)
-10. [Technical Decisions](#technical-decisions)
+5. [Security Notes](#security-notes)
+6. [User Interface](#user-interface)
+7. [Data Models](#data-models)
+8. [Services](#services)
+9. [Build Configuration](#build-configuration)
+10. [Use Cases](#use-cases)
+11. [Technical Decisions](#technical-decisions)
 
 ---
 
 ## Project Overview
 
-**MeshChat** is a peer-to-peer mesh networking chat application for Windows. It enables real-time communication between nearby devices without requiring a central server, using a combination of WiFi (TCP) and Bluetooth for connectivity. The application is built with WPF (.NET 8.0) and is optimized for deployment on school laptops with performance tuning for low-end hardware.
+**MeshChat** is a peer-to-peer chat application for Windows with limited, experimental mesh relay behavior. It enables real-time communication between nearby devices without requiring a central server, using WiFi TCP and Bluetooth RFCOMM connectivity where supported. The application is built with WPF (.NET 8.0) and is optimized for deployment on school laptops with performance tuning for low-end hardware.
 
 ### What It Does
 - Discovers nearby peers automatically using mDNS (Multicast DNS)
-- Enables real-time text messaging between peers on the same network
+- Enables real-time text messaging between directly connected peers on the same network
 - Supports file transfers using chunked transmission
-- Routes messages through multiple hops when direct connection is not possible
+- Relays targeted packets, plus targetless broadcast chat `Message` packets, through connected peers while TTL allows
 - Provides visual feedback with message status (sending, sent, delivered, read)
 - Supports emoji reactions on messages
 - Maintains chat history with local persistence
@@ -39,9 +40,9 @@
 ### 1. Dual Transport Support
 The application supports two transport mechanisms:
 - **WiFi**: TCP sockets with mDNS service discovery on port 45678
-- **Bluetooth**: RFCOMM with a custom service GUID
+- **Bluetooth**: RFCOMM with a custom service GUID, depending on pairing and Windows/platform support
 
-Both transports can operate simultaneously, allowing the application to use whichever connection is available or prefer the stronger signal.
+Both transports can operate simultaneously, allowing the application to use whichever connection is available.
 
 ### 2. Automatic Peer Discovery
 - Uses **mDNS (Multicast DNS)** via the Makaretu.Dns.Multicast library
@@ -56,11 +57,13 @@ Both transports can operate simultaneously, allowing the application to use whic
 - Message reactions with emoji support
 - Date separators in chat history
 
-### 4. Multi-Hop Mesh Routing
-- Messages can traverse up to 5 hops (configurable TTL)
-- Prevents infinite loops using visited node tracking
-- Peer list sharing allows peers to learn about distant nodes
-- Relay peers can forward messages on behalf of others
+### 4. Limited Mesh Relay
+- Targeted packets can traverse connected peers while TTL allows it
+- Targetless broadcast chat packets relay narrowly for `PacketType.Message`
+- Duplicate packet IDs and visited-node tracking suppress relay loops
+- Relay peers can forward packets on behalf of others when they are already connected
+- `PeerList` packets share currently direct peers for minimal topology discovery; discovered peers are indirect only
+- Store-and-forward offline delivery is not implemented
 
 ### 5. File Transfer
 - Chunked file transfer (32KB chunks)
@@ -131,13 +134,13 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 | Type | Purpose |
 |------|---------|
 | `Hello` | Peer announces itself on the network |
-| `HelloAck` | Response with known peer list |
+| `HelloAck` | Handshake response |
 | `Message` | Chat message payload |
 | `MessageAck` | Delivery confirmation |
 | `ReadReceipt` | Message read notification |
 | `FileChunk` | Chunk of a file transfer |
 | `FileComplete` | File transfer finished |
-| `PeerList` | Shared peer knowledge for mesh routing |
+| `PeerList` | Shares currently direct peers for minimal indirect peer discovery |
 | `Goodbye` | Peer is disconnecting |
 | `Typing` | Typing indicator |
 | `Reaction` | Emoji reaction to a message |
@@ -153,17 +156,28 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 - VisitedNodes: array of node IDs for loop prevention
 - CreatedAt: UTC timestamp
 - Payload: JSON-encoded type-specific data
+- IsEncrypted: whether Payload contains encrypted data
+- CryptoVersion: encryption payload format identifier, currently AESGCM1
 - TcpPort: sender's listening port (for Hello)
-- KnownPeers: peer list for mesh discovery
+- KnownPeers: peer list field used for minimal indirect peer discovery
 ```
 
-### Mesh Routing Algorithm
-1. When a peer receives a packet, it checks `VisitedNodes` for duplicates
-2. If not a duplicate and TTL > 0, the packet is forwarded to:
-   - Target peer (if specified)
-   - All known peers (if broadcast)
-3. TTL is decremented at each hop
-4. Peers share their `KnownPeers` list to build network topology
+### Message Payload Encryption
+- When encryption is enabled in the UI, chat `Message` packet payloads are encrypted with AES-GCM.
+- Encrypted chat payloads are marked with `IsEncrypted = true` and `CryptoVersion = AESGCM1`.
+- The `AESGCM1` payload format stores nonce, authentication tag, and ciphertext in the packet payload.
+- Current key handling is demo-grade and shared-key based: the AES key is derived from a hard-coded application passphrase.
+- There is no per-peer key exchange yet.
+- There is no peer identity verification yet.
+- This implementation should not be described as production-grade end-to-end security.
+
+### Mesh Relay Behavior
+1. Transport services suppress duplicate packets by packet ID.
+2. Packets relay only when TTL allows it and the local node is not the target.
+3. Targeted packets may be forwarded to currently connected peers that are not in `VisitedNodes`.
+4. Targetless broadcast packets are forwarded only when they are `PacketType.Message`.
+5. TTL is decremented at each relay hop and the local node is appended to `VisitedNodes`.
+6. `PeerList`/`KnownPeers` data builds minimal indirect peer awareness only; offline store-and-forward delivery is not implemented.
 
 ---
 
@@ -228,7 +242,7 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 - IpAddress: IPv4 address
 - TcpPort: listening port
 - BluetoothAddress: BT MAC address
-- HopsAway: distance in mesh (1 = direct)
+- HopsAway: observed hop distance (currently 1 for directly discovered peers)
 - RelayPeerId: which peer relays to this one
 - LastSeen: timestamp
 - UnreadCount: unread message count
@@ -245,7 +259,7 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 - Timestamp: when sent
 - FileName, FileSize, FilePath, FileProgress: file transfer fields
 - TargetPeerId: destination (null = broadcast)
-- HopCount: hops traveled
+- HopCount: hops traveled when present in message metadata
 - VisitedNodes: routing path
 - Transport: "WiFi" or "Bluetooth"
 - Reactions: dictionary of emoji -> list of user IDs
@@ -261,8 +275,22 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 - CreatedAt: UTC timestamp
 - Payload: JSON data
 - TcpPort: sender's port
-- KnownPeers: peer list for mesh discovery
+- KnownPeers: peer list field used for minimal indirect peer discovery
+- IsEncrypted: encrypted payload flag
+- CryptoVersion: encryption payload format identifier, currently AESGCM1
 ```
+
+---
+
+## Security Notes
+
+- AES-GCM protects chat message payloads when encryption is enabled.
+- Encryption metadata on `NetworkPacket` identifies AESGCM1 encrypted packets using `IsEncrypted` and `CryptoVersion`.
+- Current key handling is demo-grade and shared-key based; all peers use the same application passphrase-derived key.
+- Per-peer key exchange is not implemented yet.
+- Peer identity verification is not implemented yet.
+- Local message history is persisted as JSON and is not encrypted by MeshChat.
+- The current implementation should not be described as production-grade end-to-end security.
 
 ---
 
@@ -303,8 +331,9 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 - **Flow**:
   1. Sender reads file in chunks
   2. Each chunk sent as `FileChunk` packet
-  3. Receiver assembles chunks into buffer
-  4. On completion, saves to `Downloads/MeshChat/`
+  3. Receiver assembles chunks into a partial file
+  4. On completion, validates SHA-256 when `FileSha256` metadata is present
+  5. If validation succeeds, saves to `Downloads/MeshChat/`
 
 - **Progress Tracking**:
   - Events for progress updates (0.0 to 1.0)
@@ -312,6 +341,7 @@ The application uses a custom protocol over TCP/Bluetooth with the following pac
 
 ### MessageStore
 - **Location**: `%LOCALAPPDATA%\MeshChat\Data\messages.json`
+- **Storage format**: Plain JSON; MeshChat does not encrypt local message history
 - **Operations**:
   - `Load()`: Read messages from JSON
   - `Save()`: Persist messages to JSON
@@ -366,14 +396,14 @@ TextOptions.TextFormattingModeProperty.OverrideMetadata(
 ### 1. Classroom Collaboration
 Students in the same classroom can chat and share files without internet access or a server.
 
-### 2. Offline Emergency Communication
-When internet is down, MeshChat provides local network communication.
+### 2. Local Emergency Communication
+When internet is down, MeshChat can provide local network communication between currently connected peers. It does not provide delay-tolerant store-and-forward offline delivery.
 
 ### 3. File Sharing
 Transfer files (assignments, documents) directly between computers on the same network.
 
 ### 4. Network Discovery Learning
-Demonstrates peer-to-peer networking, mDNS discovery, and mesh routing concepts.
+Demonstrates peer-to-peer networking, mDNS discovery, and limited/experimental mesh relay concepts.
 
 ### 5. Low-Bandwidth Communication
 Efficient protocol designed for school networks with limited bandwidth.
@@ -413,9 +443,11 @@ Efficient protocol designed for school networks with limited bandwidth.
 
 ## Future Enhancements (Not Implemented)
 - Voice/video calls
-- End-to-end encryption
+- Per-peer key exchange and peer identity verification for production-grade end-to-end security
 - Message search
 - Group chats
 - File transfer resume
 - Mobile companion app
 - Network topology visualization
+- Full peer-list topology learning and route selection
+- Store-and-forward offline delivery

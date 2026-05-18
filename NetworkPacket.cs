@@ -32,6 +32,8 @@ public class NetworkPacket
 
     // Payload (type-dependent)
     public string? Payload { get; set; }         // JSON string of actual data
+    public bool IsEncrypted { get; set; }
+    public string? CryptoVersion { get; set; }
     public int TcpPort { get; set; }             // sender's listening port (for Hello)
 
     // Peer list for mesh discovery

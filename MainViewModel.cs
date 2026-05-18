@@ -276,20 +276,39 @@ public partial class MainViewModel : ObservableObject
 
     // ─── Transport Routing Helpers ──────────────────────────────────────────
 
-    private async Task SendToPeerViaTransportAsync(string peerId, NetworkPacket packet, CancellationToken cancellationToken = default)
+    private async Task<bool> SendToPeerViaTransportAsync(string peerId, NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         if (!_peerById.TryGetValue(peerId, out var peer))
         {
             // Default to WiFi if peer not found
             await _wifi.SendToPeerAsync(peerId, packet, cancellationToken);
-            return;
+            return true;
+        }
+
+        var sendPeerId = peerId;
+
+        if (!peer.IsDirectlyConnected)
+        {
+            if (packet.Type != PacketType.Message ||
+                string.IsNullOrWhiteSpace(peer.RelayPeerId) ||
+                !_peerById.TryGetValue(peer.RelayPeerId, out var relayPeer) ||
+                !relayPeer.IsDirectlyConnected ||
+                relayPeer.Status == PeerStatus.Offline)
+            {
+                return false;
+            }
+
+            sendPeerId = relayPeer.Id;
+            peer = relayPeer;
         }
 
         // Use appropriate transport based on peer's connection type
         if (peer.Transport == TransportType.Bluetooth)
-            await _bluetooth.SendToPeerAsync(peerId, packet, cancellationToken);
+            await _bluetooth.SendToPeerAsync(sendPeerId, packet, cancellationToken);
         else
-            await _wifi.SendToPeerAsync(peerId, packet, cancellationToken);
+            await _wifi.SendToPeerAsync(sendPeerId, packet, cancellationToken);
+
+        return true;
     }
 
     private async Task SendToAllViaTransportAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
@@ -354,6 +373,7 @@ public partial class MainViewModel : ObservableObject
         _bluetooth.PacketReceived += OnPacketReceived;
         _bluetooth.LogMessage += AddLog;
 
+        _fileTransfer.FileStarted += OnFileStarted;
         _fileTransfer.ProgressUpdated += OnFileProgress;
         _fileTransfer.FileReceived += OnFileReceived;
         _fileTransfer.LogMessage += AddLog;
@@ -459,9 +479,20 @@ public partial class MainViewModel : ObservableObject
 
     public async Task ConnectManualAsync(CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(ConnectIp)) return;
-        if (!int.TryParse(ConnectPort, out int port)) port = 45678;
-        await _wifi.ConnectToPeerAsync(ConnectIp.Trim(), port, cancellationToken);
+        var host = (ConnectIp ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            ShowToast("Enter a host or IP address", true);
+            return;
+        }
+
+        if (!int.TryParse(ConnectPort, out int port) || port < 1 || port > 65535)
+        {
+            ShowToast("Enter a valid port number (1-65535)", true);
+            return;
+        }
+
+        await _wifi.ConnectToPeerAsync(host, port, cancellationToken);
     }
 
     // ─── Messaging ──────────────────────────────────────────────────────────
@@ -485,7 +516,7 @@ public partial class MainViewModel : ObservableObject
             SenderName = DisplayName,
             Content = MessageInput,
             Type = MessageType.Text,
-            Status = MessageStatus.Sent,
+            Status = MessageStatus.Sending,
             ConversationId = selectedPeer.Id,
             TargetPeerId = selectedPeer.Id,
             Transport = transport
@@ -498,9 +529,11 @@ public partial class MainViewModel : ObservableObject
         Messages.Add(msg);
 
         var jsonPayload = JsonConvert.SerializeObject(msg);
+        var isEncrypted = false;
         if (EncryptionEnabled)
         {
             jsonPayload = Encrypt(jsonPayload);
+            isEncrypted = true;
         }
 
         var packet = new NetworkPacket
@@ -509,26 +542,44 @@ public partial class MainViewModel : ObservableObject
             SenderId = _wifi.LocalId,
             SenderName = DisplayName,
             TargetId = selectedPeer.Id,
-            Payload = jsonPayload
+            Payload = jsonPayload,
+            IsEncrypted = isEncrypted,
+            CryptoVersion = isEncrypted ? CryptoVersionAesGcm1 : null
         };
 
-        if (selectedPeer != null)
+        try
         {
-            await SendToPeerViaTransportAsync(selectedPeer.Id, packet, cancellationToken);
-            // Log the send event with visual indicator
-            AddLog($"[SENT \u2191] To: {selectedPeer.DisplayName} via {transport}", LogLevel.Sent);
+            if (await SendToPeerViaTransportAsync(selectedPeer.Id, packet, cancellationToken))
+            {
+                msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
+
+                // Log the send event with visual indicator
+                AddLog($"[SENT \u2191] To: {selectedPeer.DisplayName} via {transport}", LogLevel.Sent);
+            }
+            else
+            {
+                msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Failed });
+                ShowToast($"No route to {selectedPeer.DisplayName}", true);
+                AddLog($"[FAILED] No route to {selectedPeer.DisplayName}", LogLevel.Warning);
+            }
         }
-        else
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            await SendToAllViaTransportAsync(packet, cancellationToken);
-            // Log broadcast
-            AddLog($"[SENT \u2191] Broadcast to all peers via {transport}", LogLevel.Sent);
+            msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Failed });
+            ShowToast($"Failed to send to {selectedPeer.DisplayName}: {ex.Message}", true);
+            AddLog($"[FAILED] Send to {selectedPeer.DisplayName} failed: {ex.Message}", LogLevel.Error);
+            _logger.LogError(ex, "Failed to send message {MessageId} to {PeerId}", msg.Id, selectedPeer.Id);
         }
     }
 
     public async Task SendFileAsync(string filePath, CancellationToken cancellationToken = default)
     {
         if (SelectedPeer == null) return;
+        if (!SelectedPeer.IsDirectlyConnected)
+        {
+            ShowToast("File transfer requires a direct peer connection", true);
+            return;
+        }
 
         var fileInfo = new System.IO.FileInfo(filePath);
         var msg = new ChatMessage
@@ -583,15 +634,27 @@ public partial class MainViewModel : ObservableObject
             }
             else
             {
-                existing = ReplacePeer(existing, existing with
+                var shouldPromoteToDirect = peer.IsDirectlyConnected && !existing.IsDirectlyConnected;
+                existing = ReplacePeer(existing, shouldPromoteToDirect
+                    ? peer with { UnreadCount = existing.UnreadCount }
+                    : existing with
+                    {
+                        Status = PeerStatus.Online,
+                        LastSeen = DateTime.Now
+                    });
+
+                if (shouldPromoteToDirect)
                 {
-                    Status = PeerStatus.Online,
-                    LastSeen = DateTime.Now
-                });
+                    SendPeerListToPeer(peer);
+                    return;
+                }
                 // Update transport if it changed (e.g. WiFi → Both)
                 if (existing.Transport != peer.Transport)
                     ReplacePeer(existing, existing with { Transport = peer.Transport });
             }
+
+            if (peer.IsDirectlyConnected)
+                SendPeerListToPeer(peer);
         });
     }
 
@@ -651,8 +714,7 @@ public partial class MainViewModel : ObservableObject
                     break;
 
                 case PacketType.PeerList:
-                    // Peer list merging is intentionally deferred; direct discovery owns peers today.
-                    AddLog($"Ignored PeerList from {packet.SenderName ?? packet.SenderId}: mesh peer merge is unsupported", LogLevel.Info);
+                    MergePeerList(packet);
                     break;
 
                 case PacketType.Goodbye:
@@ -689,14 +751,77 @@ public partial class MainViewModel : ObservableObject
         });
     }
 
+    private void SendPeerListToPeer(Peer peer)
+    {
+        if (!peer.IsDirectlyConnected)
+            return;
+
+        var knownPeers = PeerTopology.CreateDirectPeerList(Peers, _wifi.LocalId, peer.Id);
+        if (knownPeers.Length == 0)
+            return;
+
+        var packet = new NetworkPacket
+        {
+            Type = PacketType.PeerList,
+            SenderId = _wifi.LocalId,
+            SenderName = DisplayName,
+            TargetId = peer.Id,
+            KnownPeers = knownPeers
+        };
+
+        _ = SendToPeerViaTransportAsync(peer.Id, packet, _lifetimeCts.Token);
+    }
+
+    private void MergePeerList(NetworkPacket packet)
+    {
+        if (string.IsNullOrWhiteSpace(packet.SenderId) ||
+            packet.KnownPeers == null ||
+            packet.KnownPeers.Length == 0)
+        {
+            return;
+        }
+
+        if (!_peerById.TryGetValue(packet.SenderId, out var relayPeer))
+        {
+            AddLog($"Ignored PeerList from unknown relay {packet.SenderName ?? packet.SenderId}", LogLevel.Info);
+            return;
+        }
+
+        var added = 0;
+        var updated = 0;
+
+        foreach (var peerInfo in packet.KnownPeers)
+        {
+            if (!PeerTopology.TryCreateIndirectPeer(peerInfo, relayPeer, _wifi.LocalId, out var indirectPeer))
+                continue;
+
+            if (!_peerById.TryGetValue(indirectPeer.Id, out var existing))
+            {
+                _peerById[indirectPeer.Id] = indirectPeer;
+                Peers.Add(indirectPeer);
+                added++;
+                continue;
+            }
+
+            if (existing.IsDirectlyConnected || indirectPeer.HopsAway >= existing.HopsAway)
+                continue;
+
+            ReplacePeer(existing, indirectPeer with { UnreadCount = existing.UnreadCount });
+            updated++;
+        }
+
+        if (added > 0 || updated > 0)
+            AddLog($"Merged PeerList from {relayPeer.DisplayName}: {added} discovered, {updated} updated", LogLevel.Info);
+    }
+
     private async Task HandleIncomingMessageAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         if (packet.Payload == null) return;
 
         var payload = packet.Payload;
-        if (EncryptionEnabled)
+        if (packet.IsEncrypted)
         {
-            if (!TryDecrypt(payload, out payload))
+            if (!TryDecrypt(payload, packet.CryptoVersion, out payload))
             {
                 AddLog($"Dropped encrypted message from {packet.SenderName ?? packet.SenderId}: decryption failed", LogLevel.Warning);
                 return;
@@ -727,6 +852,33 @@ public partial class MainViewModel : ObservableObject
         };
 
         var peerId = packet.SenderId;
+        var isDuplicate = !string.IsNullOrWhiteSpace(msg.Id) && _messageById.ContainsKey(msg.Id);
+
+        if (isDuplicate)
+        {
+            if (!isBroadcast && SelectedPeer?.Id == peerId)
+            {
+                var readReceipt = new NetworkPacket
+                {
+                    Type = PacketType.ReadReceipt,
+                    SenderId = _wifi.LocalId,
+                    SenderName = DisplayName,
+                    Payload = msg.Id
+                };
+                await SendToPeerViaTransportAsync(peerId, readReceipt, cancellationToken);
+            }
+
+            var duplicateAck = new NetworkPacket
+            {
+                Type = PacketType.MessageAck,
+                SenderId = _wifi.LocalId,
+                SenderName = DisplayName,
+                Payload = msg.Id
+            };
+            await SendToPeerViaTransportAsync(peerId, duplicateAck, cancellationToken);
+            return;
+        }
+
         msg = AddMessageToHistory(conversationId, msg);
 
         // Show message if viewing this peer OR in broadcast view (no peer selected)
@@ -780,14 +932,14 @@ public partial class MainViewModel : ObservableObject
     {
         var msgId = packet.Payload;
         if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
-            ReplaceMessage(msg, msg with { Status = MessageStatus.Delivered });
+            MarkMessageStatusAtLeast(msg, MessageStatus.Delivered);
     }
 
     private void HandleReadReceipt(NetworkPacket packet)
     {
         var msgId = packet.Payload;
         if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
-            ReplaceMessage(msg, msg with { Status = MessageStatus.Read });
+            MarkMessageStatusAtLeast(msg, MessageStatus.Read);
     }
 
     public async Task AddReactionAsync(string messageId, string emoji, CancellationToken cancellationToken = default)
@@ -799,8 +951,6 @@ public partial class MainViewModel : ObservableObject
         bool isAdding = ToggleReaction(msg, emoji, _wifi.LocalId);
         msg = ReplaceMessage(msg, msg with { Reactions = CloneReactions(msg.Reactions) });
 
-        // Notify property changed to update UI
-        msg.NotifyReactionsChanged();
         OnPropertyChanged(nameof(Messages));
 
         // Send reaction to network
@@ -858,8 +1008,6 @@ public partial class MainViewModel : ObservableObject
 
             msg = ReplaceMessage(msg, msg with { Reactions = CloneReactions(msg.Reactions) });
 
-            // Notify property changed
-            msg.NotifyReactionsChanged();
             OnPropertyChanged(nameof(Messages));
 
             // Log the reaction
@@ -870,6 +1018,46 @@ public partial class MainViewModel : ObservableObject
         {
             AddLog($"Error handling reaction: {ex.Message}", LogLevel.Error);
         }
+    }
+
+    private void OnFileStarted(FileTransferStartedInfo info)
+    {
+        _dispatcher.Invoke(() =>
+        {
+            if (_messageById.ContainsKey(info.MessageId))
+                return;
+
+            var isBroadcast = string.IsNullOrWhiteSpace(info.TargetId);
+            var conversationId = isBroadcast ? BroadcastConversationId : info.SenderId;
+            var msg = new ChatMessage
+            {
+                Id = info.MessageId,
+                SenderId = info.SenderId,
+                SenderName = string.IsNullOrWhiteSpace(info.SenderName) ? "Unknown" : info.SenderName,
+                Type = MessageType.File,
+                Status = MessageStatus.Sending,
+                FileName = info.FileName,
+                FileSize = info.TotalSize,
+                FileProgress = 0,
+                ConversationId = conversationId,
+                TargetPeerId = info.TargetId,
+                Transport = ResolvePeerTransportName(info.SenderId)
+            };
+
+            msg = AddMessageToHistory(conversationId, msg);
+
+            var isViewingThisPeer = !isBroadcast && SelectedPeer?.Id == info.SenderId;
+            var isInBroadcastView = SelectedPeer == null;
+            if (isViewingThisPeer || isInBroadcastView)
+            {
+                Messages.Add(msg);
+            }
+            else if (!isBroadcast && _peerById.TryGetValue(info.SenderId, out var peer))
+            {
+                ReplacePeer(peer, peer with { UnreadCount = peer.UnreadCount + 1 });
+                UpdateUnreadCounts();
+            }
+        });
     }
 
     private void OnFileProgress(string msgId, double progress)
@@ -961,6 +1149,32 @@ public partial class MainViewModel : ObservableObject
         IndexReactions(updated);
         _ = SaveMessagesAsync(_lifetimeCts.Token);
         return updated;
+    }
+
+    private ChatMessage MarkMessageStatusAtLeast(ChatMessage msg, MessageStatus status)
+        => GetMessageStatusRank(msg.Status) >= GetMessageStatusRank(status)
+            ? msg
+            : ReplaceMessage(msg, msg with { Status = status });
+
+    private static int GetMessageStatusRank(MessageStatus status) => status switch
+    {
+        MessageStatus.Sending => 0,
+        MessageStatus.Sent => 1,
+        MessageStatus.Delivered => 2,
+        MessageStatus.Read => 3,
+        MessageStatus.Failed => 4,
+        _ => 0
+    };
+
+    private string ResolvePeerTransportName(string peerId)
+    {
+        if (_peerById.TryGetValue(peerId, out var peer) &&
+            peer.Transport == TransportType.Bluetooth)
+        {
+            return "Bluetooth";
+        }
+
+        return "WiFi";
     }
 
     private Peer ReplacePeer(Peer current, Peer updated)
@@ -1404,6 +1618,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     // ─── Message Encryption (AES-GCM with shared key) ────────────────────────
+    private const string CryptoVersionAesGcm1 = "AESGCM1";
     private const string EncryptionKey = "MeshChatSecretKey2024!";
 
     private string Encrypt(string plainText)
@@ -1437,24 +1652,23 @@ public partial class MainViewModel : ObservableObject
         Buffer.BlockCopy(tag, 0, encryptedBytes, nonce.Length, tag.Length);
         Buffer.BlockCopy(cipherBytes, 0, encryptedBytes, nonce.Length + tag.Length, cipherBytes.Length);
 
-        return "AESGCM1:" + Convert.ToBase64String(encryptedBytes);
+        return CryptoVersionAesGcm1 + ":" + Convert.ToBase64String(encryptedBytes);
     }
 
-    private bool TryDecrypt(string encryptedText, out string plainText)
+    private bool TryDecrypt(string encryptedText, string? cryptoVersion, out string plainText)
     {
         plainText = encryptedText;
-        if (string.IsNullOrEmpty(encryptedText) || !EncryptionEnabled) return true;
+        if (string.IsNullOrEmpty(encryptedText)) return false;
+        if (cryptoVersion != CryptoVersionAesGcm1) return false;
 
         try
         {
-            const string prefix = "AESGCM1:";
+            const string prefix = CryptoVersionAesGcm1 + ":";
             const int nonceSize = 12;
             const int tagSize = 16;
 
-            // Messages without the AES-GCM prefix are treated as plaintext so
-            // peers can still interoperate when encryption is disabled.
             if (!encryptedText.StartsWith(prefix, StringComparison.Ordinal))
-                return true;
+                return false;
 
             var encryptedBytes = Convert.FromBase64String(encryptedText[prefix.Length..]);
             if (encryptedBytes.Length < nonceSize + tagSize)

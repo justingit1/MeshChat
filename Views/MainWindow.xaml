@@ -531,6 +531,12 @@
                                                                        Foreground="{StaticResource TextSecondaryBrush}"
                                                                        FontSize="11"
                                                                        Margin="0,2,0,0"/>
+                                                            <TextBlock Text="{Binding FilePath}"
+                                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                                       FontSize="11"
+                                                                       TextWrapping="Wrap"
+                                                                       Margin="0,4,0,0"
+                                                                       Visibility="{Binding FilePath, Converter={StaticResource StringToVisConverter}}"/>
                                                             <ProgressBar Value="{Binding FileProgress}"
                                                                          Maximum="1"
                                                                          Height="5"

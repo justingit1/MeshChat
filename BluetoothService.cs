@@ -215,7 +215,7 @@ public class BluetoothService : INetworkService
                 if (!MarkPacketSeen(packet.Id)) continue;
 
                 // Relay if needed
-                if (packet.Ttl > 1 && packet.TargetId != LocalId && packet.TargetId != null)
+                if (ShouldRelayPacket(packet))
                 {
                     await RelayPacketAsync(CreateRelayPacket(packet), ct);
                 }
@@ -266,6 +266,8 @@ public class BluetoothService : INetworkService
             VisitedNodes = visited.ToArray(),
             CreatedAt = packet.CreatedAt,
             Payload = packet.Payload,
+            IsEncrypted = packet.IsEncrypted,
+            CryptoVersion = packet.CryptoVersion,
             TcpPort = packet.TcpPort,
             KnownPeers = packet.KnownPeers
         };
@@ -273,6 +275,11 @@ public class BluetoothService : INetworkService
 
     private bool ShouldDeliverToApplication(NetworkPacket packet)
         => packet.TargetId == null || packet.TargetId == LocalId;
+
+    private bool ShouldRelayPacket(NetworkPacket packet)
+        => packet.Ttl > 1
+           && packet.TargetId != LocalId
+           && (packet.TargetId != null || packet.Type == PacketType.Message);
 
     private bool MarkPacketSeen(string packetId)
     {

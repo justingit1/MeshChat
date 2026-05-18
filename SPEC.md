@@ -3,7 +3,7 @@
 ## Project Overview
 - **Project name**: MeshChat Mockup
 - **Type**: Static HTML visual mockup (screenshot-style)
-- **Core functionality**: Display a non-interactive UI mockup of a mesh networking chat application optimized for 1200×800px screenshot/printing
+- **Core functionality**: Display a non-interactive UI mockup of a peer-to-peer chat application with limited mesh relay status, optimized for 1200×800px screenshot/printing
 - **Target users**: Document/presentation viewers
 
 ## UI/UX Specification
@@ -70,7 +70,7 @@
 
 #### Status Bar (two lines)
 - Line 1: "Online · Port 45678 · Bluetooth connected"
-- Line 2: "Min 2 devices · Mesh routing enabled"
+- Line 2: "Min 2 devices · Limited mesh relay"
 
 ## Functionality Specification
 

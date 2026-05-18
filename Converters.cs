@@ -1,5 +1,7 @@
 using System;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Windows;
 using System.Windows.Data;
 using System.Windows.Documents;
@@ -315,9 +317,9 @@ public class AvatarGradientConverter : IValueConverter
     {
         if (value is string id && !string.IsNullOrEmpty(id))
         {
-            // Use hash of ID to consistently pick a gradient
-            var hash = Math.Abs(id.GetHashCode());
-            return Gradients[hash % Gradients.Length];
+            // Use a stable hash so peer IDs keep the same gradient after restarts.
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(id));
+            return Gradients[hash[0] % Gradients.Length];
         }
         return Gradients[0];
     }

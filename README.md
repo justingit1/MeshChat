@@ -1,16 +1,16 @@
 # MeshChat
 
-A peer-to-peer mesh networking chat application for Windows that enables real-time communication between nearby devices without requiring a central server.
+A peer-to-peer chat application for Windows that enables real-time communication between nearby devices without requiring a central server. Mesh-style relay support is limited and experimental.
 
 ## Features
 
-- **Dual Transport Support** - Uses both WiFi (TCP) and Bluetooth for connectivity
+- **Dual Transport Support** - Uses WiFi TCP for direct messaging and Bluetooth RFCOMM when pairing/platform support allows it
 - **Automatic Peer Discovery** - Discovers nearby peers using mDNS (Multicast DNS)
 - **Real-Time Messaging** - Send text messages with delivery tracking, typing indicators, and read receipts
-- **Multi-Hop Mesh Routing** - Messages can traverse up to 5 hops when direct connection isn't possible
+- **Limited Mesh Relay** - Targeted packets, plus targetless chat `Message` broadcasts, can relay through connected peers while TTL allows
 - **File Transfer** - Share files between peers with chunked transmission and progress tracking
 - **Message Reactions** - Add emoji reactions to messages
-- **Local Chat History** - Messages are persisted locally
+- **Local Chat History** - Messages are persisted locally; offline store-and-forward delivery is not implemented
 - **Built-in Logging** - Debug panel for monitoring network events
 
 ## Screenshots
@@ -62,15 +62,19 @@ The executable will be in `bin/Release/net8.0/win-x64/publish/`.
 
 ### Network Discovery
 - **WiFi**: Uses mDNS to advertise and discover services on the local network
-- **Bluetooth**: Uses RFCOMM for device-to-device communication
+- **Bluetooth**: Uses RFCOMM for device-to-device communication when devices are paired and the platform permits it
 
 Both transports can work simultaneously. The application will use whichever connection is available.
 
-### Mesh Routing
-When peers aren't directly connected, MeshChat can route messages through intermediate peers:
-- Messages can hop up to 5 times (configurable TTL)
-- The network automatically learns about distant peers through peer list sharing
-- Duplicate detection prevents infinite loops
+### Mesh Relay Status
+MeshChat has limited, experimental relay behavior rather than full topology-aware mesh routing:
+- Direct WiFi messaging works over TCP connections.
+- Bluetooth RFCOMM support exists, but depends on pairing and Windows/platform support.
+- Targeted packets can be relayed by connected peers while TTL allows it.
+- Targetless broadcast chat packets relay narrowly only for `PacketType.Message`.
+- Duplicate packet IDs and visited-node tracking suppress relay loops.
+- `PeerList`/`KnownPeers` shares currently direct peers for minimal topology discovery; discovered peers are marked indirect and are not used for store-and-forward.
+- Store-and-forward offline delivery is not implemented.
 
 ## Project Structure
 
@@ -113,10 +117,22 @@ MeshChat uses a custom protocol over TCP/Bluetooth with these packet types:
 - `Message` / `MessageAck` - Chat messages with delivery confirmation
 - `ReadReceipt` - Message read notifications
 - `FileChunk` / `FileComplete` - File transfer packets
-- `PeerList` - Shared peer knowledge for mesh routing
+- `PeerList` - Shares currently direct peers for minimal indirect peer discovery
 - `Typing` - Typing indicator
 - `Reaction` - Emoji reactions
 - `Goodbye` - Disconnect notification
+
+`NetworkPacket` includes encryption metadata fields:
+- `IsEncrypted` - indicates that the packet payload is encrypted
+- `CryptoVersion` - identifies the encryption payload format, currently `AESGCM1`
+
+### Security Notes
+- When encryption is enabled, chat message payloads are protected with AES-GCM and marked with `IsEncrypted` plus `CryptoVersion = AESGCM1`.
+- Current key handling is demo-grade: all peers use a shared application key derived from a hard-coded passphrase.
+- MeshChat does not yet implement per-peer key exchange or peer identity verification.
+- Local message history is stored as JSON at `%LOCALAPPDATA%\MeshChat\Data\messages.json`; it is not encrypted by MeshChat.
+- Local persistence is chat history only; it is not store-and-forward offline delivery.
+- This should not be described as production-grade end-to-end security.
 
 ### Performance Optimizations
 - Self-contained single-file deployment
@@ -135,7 +151,7 @@ MeshChat uses a custom protocol over TCP/Bluetooth with these packet types:
 - **Classroom Collaboration** - Students can chat and share files without internet
 - **Offline Communication** - Local network communication when internet is unavailable
 - **File Sharing** - Transfer files directly between computers on the same network
-- **Networking Learning** - Demonstrates peer-to-peer and mesh networking concepts
+- **Networking Learning** - Demonstrates peer-to-peer networking and limited/experimental mesh relay concepts
 
 ## License
 

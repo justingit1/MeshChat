@@ -51,8 +51,4 @@ public record ChatMessage
 
     // Message reactions (emoji -> list of user IDs)
     public Dictionary<string, List<string>> Reactions { get; init; } = [];
-
-    public void NotifyReactionsChanged()
-    {
-    }
 }
