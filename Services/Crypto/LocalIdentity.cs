@@ -22,6 +22,16 @@ public sealed class LocalIdentity : IDisposable
     public static LocalIdentity Generate()
         => new(ECDsa.Create(ECCurve.NamedCurves.nistP256));
 
+    public static LocalIdentity FromPkcs8PrivateKey(ReadOnlySpan<byte> privateKey)
+    {
+        var signingKey = ECDsa.Create();
+        signingKey.ImportPkcs8PrivateKey(privateKey, out _);
+        return new LocalIdentity(signingKey);
+    }
+
+    public byte[] ExportPrivateKey()
+        => _signingKey.ExportPkcs8PrivateKey();
+
     public byte[] ExportPublicKey()
         => (byte[])_publicKey.Clone();
 
