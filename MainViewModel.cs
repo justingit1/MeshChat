@@ -52,6 +52,7 @@ public partial class MainViewModel : ObservableObject
     public BulkObservableCollection<LogEntry> Logs { get; } = [];
     public ICollectionView FilteredMessages { get; }
     public ICollectionView FilteredLogs { get; }
+    public string SelectedPeerSecurityStatus => SelectedPeer?.SecurityStatus ?? "Broadcast";
 
     private Peer? _selectedPeer;
     public Peer? SelectedPeer
@@ -61,6 +62,8 @@ public partial class MainViewModel : ObservableObject
         {
             if (!SetProperty(ref _selectedPeer, value))
                 return;
+
+            OnPropertyChanged(nameof(SelectedPeerSecurityStatus));
 
             // Use dispatcher to ensure thread safety
             _dispatcher.Invoke(() =>
@@ -295,6 +298,9 @@ public partial class MainViewModel : ObservableObject
 
     private async Task<bool> SendToPeerViaTransportAsync(string peerId, NetworkPacket packet, CancellationToken cancellationToken = default)
     {
+        if (packet.Type == PacketType.Message && IsPeerBlocked(peerId))
+            return false;
+
         if (!_peerById.TryGetValue(peerId, out var peer))
         {
             // Default to WiFi if peer not found
@@ -373,6 +379,12 @@ public partial class MainViewModel : ObservableObject
                     return;
 
                 var packet = CreateRetryPacket(peerId, msg, isEncrypted);
+                if (IsVerifiedDirectTextWithoutEncryption(peerId, packet))
+                {
+                    QueueMessageAfterAckRetries(msg.Id, $"Encrypted session unavailable for {peerDisplayName}");
+                    return;
+                }
+
                 if (!await SendToPeerViaTransportAsync(peerId, packet, cancellationToken))
                 {
                     QueueMessageAfterAckRetries(msg.Id, $"No route to {peerDisplayName}");
@@ -404,19 +416,18 @@ public partial class MainViewModel : ObservableObject
     private NetworkPacket CreateRetryPacket(string peerId, ChatMessage msg, bool isEncrypted)
     {
         var payload = JsonConvert.SerializeObject(msg);
-        if (isEncrypted)
-            payload = Encrypt(payload);
 
-        return new NetworkPacket
+        var packet = new NetworkPacket
         {
             Type = PacketType.Message,
             SenderId = _wifi.LocalId,
             SenderName = DisplayName,
             TargetId = peerId,
-            Payload = payload,
-            IsEncrypted = isEncrypted,
-            CryptoVersion = isEncrypted ? CryptoVersionAesGcm1 : null
+            Payload = payload
         };
+
+        ApplyDirectMessageEncryption(peerId, packet, isEncrypted);
+        return packet;
     }
 
     private bool ShouldRetryForAck(string messageId)
@@ -495,6 +506,12 @@ public partial class MainViewModel : ObservableObject
             }
 
             peerId = msg.TargetPeerId!;
+            if (IsPeerBlocked(peerId))
+            {
+                AddLog($"[QUEUED] Blocked peer {peerId}; queued message not resent", LogLevel.Warning);
+                return;
+            }
+
             if (!HasAvailableMessageRoute(peerId))
                 return;
 
@@ -511,6 +528,11 @@ public partial class MainViewModel : ObservableObject
             });
 
             var packet = CreateRetryPacket(peerId, attempting, isEncrypted);
+            if (IsVerifiedDirectTextWithoutEncryption(peerId, packet))
+            {
+                QueueOutgoingTextMessage(attempting, $"Encrypted session unavailable for {peerDisplayName}");
+                return;
+            }
 
             try
             {
@@ -521,7 +543,7 @@ public partial class MainViewModel : ObservableObject
                         Status = MessageStatus.Sent,
                         QueuedAt = null
                     });
-                    TrackAckRetry(peerId, sent, isEncrypted, peerDisplayName);
+                    TrackAckRetry(peerId, sent, packet.IsEncrypted, peerDisplayName);
                     AddLog($"[RESENT] To: {peerDisplayName}", LogLevel.Sent);
                     return;
                 }
@@ -545,6 +567,9 @@ public partial class MainViewModel : ObservableObject
 
     private bool HasAvailableMessageRoute(string peerId)
     {
+        if (IsPeerBlocked(peerId))
+            return false;
+
         if (!_peerById.TryGetValue(peerId, out var peer) || peer.Status == PeerStatus.Offline)
             return false;
 
@@ -814,6 +839,12 @@ public partial class MainViewModel : ObservableObject
             return;
         }
         var selectedPeer = SelectedPeer;
+        if (IsPeerBlocked(selectedPeer.Id))
+        {
+            ShowToast($"{selectedPeer.DisplayName} is blocked", true);
+            AddLog($"[BLOCKED] Direct message to {selectedPeer.DisplayName} was not sent", LogLevel.Warning);
+            return;
+        }
 
         // Determine transport based on selected peer or broadcast
         string transport = selectedPeer.Transport == TransportType.Bluetooth ? "Bluetooth" : "WiFi";
@@ -837,12 +868,6 @@ public partial class MainViewModel : ObservableObject
         Messages.Add(msg);
 
         var jsonPayload = JsonConvert.SerializeObject(msg);
-        var isEncrypted = false;
-        if (EncryptionEnabled)
-        {
-            jsonPayload = Encrypt(jsonPayload);
-            isEncrypted = true;
-        }
 
         var packet = new NetworkPacket
         {
@@ -850,17 +875,21 @@ public partial class MainViewModel : ObservableObject
             SenderId = _wifi.LocalId,
             SenderName = DisplayName,
             TargetId = selectedPeer.Id,
-            Payload = jsonPayload,
-            IsEncrypted = isEncrypted,
-            CryptoVersion = isEncrypted ? CryptoVersionAesGcm1 : null
+            Payload = jsonPayload
         };
+        ApplyDirectMessageEncryption(selectedPeer.Id, packet, EncryptionEnabled);
+        if (IsVerifiedDirectTextWithoutEncryption(selectedPeer.Id, packet))
+        {
+            msg = QueueOutgoingTextMessage(msg, $"Encrypted session unavailable for {selectedPeer.DisplayName}");
+            return;
+        }
 
         try
         {
             if (await SendToPeerViaTransportAsync(selectedPeer.Id, packet, cancellationToken))
             {
                 msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
-                TrackAckRetry(selectedPeer.Id, msg, isEncrypted, selectedPeer.DisplayName);
+                TrackAckRetry(selectedPeer.Id, msg, packet.IsEncrypted, selectedPeer.DisplayName);
 
                 // Log the send event with visual indicator
                 AddLog($"[SENT \u2191] To: {selectedPeer.DisplayName} via {transport}", LogLevel.Sent);
@@ -922,6 +951,7 @@ public partial class MainViewModel : ObservableObject
         {
             // Deduplicate by ID — also guard against discovering ourselves
             if (peer.Id == _wifi.LocalId) return;
+            peer = ApplyPeerSecurityStatus(peer);
 
             if (!_peerById.TryGetValue(peer.Id, out var existing))
             {
@@ -1002,6 +1032,12 @@ public partial class MainViewModel : ObservableObject
     {
         _dispatcher.Invoke(() =>
         {
+            if (!string.IsNullOrWhiteSpace(packet.TargetId) && IsPeerBlocked(packet.SenderId))
+            {
+                AddLog($"[BLOCKED] Dropped targeted {packet.Type} from {packet.SenderName ?? packet.SenderId}", LogLevel.Warning);
+                return;
+            }
+
             switch (packet.Type)
             {
                 case PacketType.Message:
@@ -1179,6 +1215,7 @@ public partial class MainViewModel : ObservableObject
             }
 
             AddLog($"[KeyExchange] Established with {peerName}", LogLevel.Success);
+            RefreshPeerSecurityStatus(payload.SenderPeerId);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -1210,6 +1247,7 @@ public partial class MainViewModel : ObservableObject
             }
 
             AddLog($"[KeyExchange] Established with {peerName}", LogLevel.Success);
+            RefreshPeerSecurityStatus(payload.SenderPeerId);
         }
         catch (Exception ex)
         {
@@ -1240,6 +1278,7 @@ public partial class MainViewModel : ObservableObject
             payload.IdentityPublicKey,
             fingerprint);
         _peerTrustStore.Save();
+        RefreshPeerSecurityStatus(payload.SenderPeerId);
         return true;
     }
 
@@ -1280,12 +1319,7 @@ public partial class MainViewModel : ObservableObject
 
     private SessionKeyManager EnsureSessionKeyManager()
     {
-        if (!_peerTrustStoreLoaded)
-        {
-            if (_loadPeerTrustStoreOnInitialize)
-                _peerTrustStore.Load();
-            _peerTrustStoreLoaded = true;
-        }
+        EnsurePeerTrustStoreLoaded();
 
         if (_localIdentity == null)
         {
@@ -1298,7 +1332,110 @@ public partial class MainViewModel : ObservableObject
     }
 
     private bool IsPeerBlocked(string peerId)
-        => _peerTrustStore.GetByPeerId(peerId)?.TrustState == TrustState.Blocked;
+    {
+        if (_peerTrustStore == null)
+            return false;
+
+        EnsurePeerTrustStoreLoaded();
+        return _peerTrustStore.GetByPeerId(peerId)?.TrustState == TrustState.Blocked;
+    }
+
+    private void EnsurePeerTrustStoreLoaded()
+    {
+        if (_peerTrustStore == null)
+            return;
+
+        if (_peerTrustStoreLoaded)
+            return;
+
+        if (_loadPeerTrustStoreOnInitialize)
+            _peerTrustStore.Load();
+        _peerTrustStoreLoaded = true;
+    }
+
+    private Peer ApplyPeerSecurityStatus(Peer peer)
+    {
+        if (_peerTrustStore == null)
+            return peer;
+
+        EnsurePeerTrustStoreLoaded();
+        var trustedPeer = _peerTrustStore.GetByPeerId(peer.Id);
+        var trustState = trustedPeer?.TrustState ?? TrustState.Unknown;
+        var hasConfirmedSession = _sessionKeyManager?.GetActiveSession(peer.Id) is { IsConfirmed: true };
+        var fingerprintShort = GetFingerprintShort(trustedPeer?.Fingerprint);
+        var securityStatus = GetSecurityStatus(trustState, hasConfirmedSession);
+
+        return peer with
+        {
+            TrustState = trustState,
+            FingerprintShort = fingerprintShort,
+            SecurityStatus = securityStatus
+        };
+    }
+
+    private static string GetFingerprintShort(string? fingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(fingerprint))
+            return string.Empty;
+
+        var compact = fingerprint.Replace(":", "", StringComparison.Ordinal).Trim();
+        return compact.Length <= 12 ? compact : compact[..12];
+    }
+
+    private static string GetSecurityStatus(TrustState trustState, bool hasConfirmedSession)
+        => trustState switch
+        {
+            TrustState.Blocked => "Blocked",
+            TrustState.Verified => hasConfirmedSession ? "Encrypted · Verified" : "Verified",
+            _ => hasConfirmedSession ? "Encrypted · Unverified" : "Unverified"
+        };
+
+    private void RefreshPeerSecurityStatus(string peerId)
+    {
+        if (!_peerById.TryGetValue(peerId, out var peer))
+            return;
+
+        ReplacePeer(peer, ApplyPeerSecurityStatus(peer));
+    }
+
+    public void MarkSelectedPeerVerified()
+    {
+        if (SelectedPeer == null)
+            return;
+
+        EnsurePeerTrustStoreLoaded();
+        if (_peerTrustStore.MarkVerified(SelectedPeer.Id) == null)
+        {
+            ShowToast("Peer identity is not available yet", true);
+            return;
+        }
+
+        _peerTrustStore.Save();
+        RefreshPeerSecurityStatus(SelectedPeer.Id);
+    }
+
+    public void BlockSelectedPeer()
+    {
+        if (SelectedPeer == null)
+            return;
+
+        EnsurePeerTrustStoreLoaded();
+        _peerTrustStore.MarkBlocked(SelectedPeer.Id, SelectedPeer.DisplayName);
+        _peerTrustStore.Save();
+        _sessionKeyManager?.RemoveSession(SelectedPeer.Id);
+        RefreshPeerSecurityStatus(SelectedPeer.Id);
+    }
+
+    public void UnblockSelectedPeer()
+    {
+        if (SelectedPeer == null)
+            return;
+
+        EnsurePeerTrustStoreLoaded();
+        _peerTrustStore.Unblock(SelectedPeer.Id);
+        _peerTrustStore.Save();
+        RefreshPeerSecurityStatus(SelectedPeer.Id);
+    }
 
     private string GetPeerDisplayName(NetworkPacket packet)
         => string.IsNullOrWhiteSpace(packet.SenderName) ? packet.SenderId : packet.SenderName;
@@ -1351,11 +1488,20 @@ public partial class MainViewModel : ObservableObject
     private async Task HandleIncomingMessageAsync(NetworkPacket packet, CancellationToken cancellationToken = default)
     {
         if (packet.Payload == null) return;
+        if (!string.IsNullOrWhiteSpace(packet.TargetId) && IsPeerBlocked(packet.SenderId))
+        {
+            AddLog($"[BLOCKED] Dropped direct message from {packet.SenderName ?? packet.SenderId}", LogLevel.Warning);
+            return;
+        }
 
         var payload = packet.Payload;
         if (packet.IsEncrypted)
         {
-            if (!TryDecrypt(payload, packet.CryptoVersion, out payload))
+            var decrypted = packet.CryptoVersion == CryptoVersionEcdhAesGcm2
+                ? TryDecryptSessionMessage(packet, out payload)
+                : TryDecrypt(payload, packet.CryptoVersion, out payload);
+
+            if (!decrypted)
             {
                 AddLog($"Dropped encrypted message from {packet.SenderName ?? packet.SenderId}: decryption failed", LogLevel.Warning);
                 return;
@@ -1464,6 +1610,9 @@ public partial class MainViewModel : ObservableObject
 
     private void HandleDeliveryAck(NetworkPacket packet)
     {
+        if (IsPeerBlocked(packet.SenderId))
+            return;
+
         var msgId = packet.Payload;
         if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
             MarkMessageStatusAtLeast(msg, MessageStatus.Delivered);
@@ -1471,6 +1620,9 @@ public partial class MainViewModel : ObservableObject
 
     private void HandleReadReceipt(NetworkPacket packet)
     {
+        if (IsPeerBlocked(packet.SenderId))
+            return;
+
         var msgId = packet.Payload;
         if (msgId != null && _messageById.TryGetValue(msgId, out var msg))
             MarkMessageStatusAtLeast(msg, MessageStatus.Read);
@@ -1730,6 +1882,7 @@ public partial class MainViewModel : ObservableObject
         if (SelectedPeer?.Id == current.Id)
         {
             SetProperty(ref _selectedPeer, updated, nameof(SelectedPeer));
+            OnPropertyChanged(nameof(SelectedPeerSecurityStatus));
         }
 
         return updated;
@@ -2159,7 +2312,153 @@ public partial class MainViewModel : ObservableObject
 
     // ─── Message Encryption (AES-GCM with shared key) ────────────────────────
     private const string CryptoVersionAesGcm1 = "AESGCM1";
+    private const string CryptoVersionEcdhAesGcm2 = SessionKeyManager.CryptoVersion;
     private const string EncryptionKey = "MeshChatSecretKey2024!";
+
+    private void ApplyDirectMessageEncryption(string peerId, NetworkPacket packet, bool useLegacyEncryption)
+    {
+        if (TryApplySessionMessageEncryption(peerId, packet))
+            return;
+
+        if (!useLegacyEncryption || !EncryptionEnabled || string.IsNullOrEmpty(packet.Payload))
+            return;
+
+        packet.Payload = Encrypt(packet.Payload);
+        packet.IsEncrypted = true;
+        packet.CryptoVersion = CryptoVersionAesGcm1;
+    }
+
+    private bool IsVerifiedDirectTextWithoutEncryption(string peerId, NetworkPacket packet)
+    {
+        if (packet.Type != PacketType.Message ||
+            packet.IsEncrypted ||
+            string.IsNullOrWhiteSpace(packet.TargetId))
+        {
+            return false;
+        }
+
+        EnsurePeerTrustStoreLoaded();
+        return _peerTrustStore.GetByPeerId(peerId)?.TrustState == TrustState.Verified;
+    }
+
+    private bool TryApplySessionMessageEncryption(string peerId, NetworkPacket packet)
+    {
+        if (packet.Type != PacketType.Message ||
+            string.IsNullOrWhiteSpace(packet.Payload) ||
+            string.IsNullOrWhiteSpace(packet.TargetId) ||
+            !_peerById.TryGetValue(peerId, out var peer) ||
+            !peer.IsDirectlyConnected ||
+            _sessionKeyManager == null)
+        {
+            return false;
+        }
+
+        var session = _sessionKeyManager.GetActiveSession(peerId);
+        if (session is not { IsConfirmed: true })
+            return false;
+
+        if (!_sessionKeyManager.TryReserveNextSendMessageCounter(peerId, out session, out var counter) ||
+            session is not { IsConfirmed: true })
+        {
+            return false;
+        }
+
+        var plainBytes = System.Text.Encoding.UTF8.GetBytes(packet.Payload);
+        var associatedData = CreateSessionMessageAssociatedData(
+            packet.SenderId,
+            packet.TargetId,
+            session.SessionId,
+            counter);
+        var encrypted = SessionCryptoService.Encrypt(session.SendKey, plainBytes, associatedData);
+
+        packet.Payload = Convert.ToBase64String(encrypted.Ciphertext);
+        packet.IsEncrypted = true;
+        packet.CryptoVersion = CryptoVersionEcdhAesGcm2;
+        packet.CryptoSessionId = session.SessionId;
+        packet.CryptoNonce = Convert.ToBase64String(encrypted.Nonce);
+        packet.CryptoTag = Convert.ToBase64String(encrypted.Tag);
+        packet.CryptoMessageCounter = counter;
+        return true;
+    }
+
+    private bool TryDecryptSessionMessage(NetworkPacket packet, out string plainText)
+    {
+        plainText = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(packet.Payload) ||
+            string.IsNullOrWhiteSpace(packet.CryptoSessionId) ||
+            string.IsNullOrWhiteSpace(packet.CryptoNonce) ||
+            string.IsNullOrWhiteSpace(packet.CryptoTag) ||
+            string.IsNullOrWhiteSpace(packet.SenderId) ||
+            packet.CryptoMessageCounter == null ||
+            _sessionKeyManager == null)
+        {
+            return false;
+        }
+
+        var session = _sessionKeyManager.GetActiveSession(packet.SenderId);
+        if (session is not { IsConfirmed: true } ||
+            !session.SessionId.Equals(packet.CryptoSessionId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        try
+        {
+            var counter = packet.CryptoMessageCounter.Value;
+            var associatedData = CreateSessionMessageAssociatedData(
+                packet.SenderId,
+                packet.TargetId,
+                packet.CryptoSessionId,
+                counter);
+            var encrypted = new AesGcmEncryptedPayload(
+                Convert.FromBase64String(packet.CryptoNonce),
+                Convert.FromBase64String(packet.Payload),
+                Convert.FromBase64String(packet.CryptoTag));
+            var plainBytes = SessionCryptoService.Decrypt(session.ReceiveKey, encrypted, associatedData);
+            if (!_sessionKeyManager.TryAdvanceReceiveMessageCounter(
+                    packet.SenderId,
+                    packet.CryptoSessionId,
+                    counter,
+                    out var lastSeenCounter))
+            {
+                AddLog(
+                    $"Dropped ECDH_AESGCM2 replay/old-counter message from {packet.SenderName ?? packet.SenderId}: counter {counter}, last accepted {lastSeenCounter}",
+                    LogLevel.Warning);
+                return false;
+            }
+
+            plainText = System.Text.Encoding.UTF8.GetString(plainBytes);
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+        catch (CryptographicException)
+        {
+            return false;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static byte[] CreateSessionMessageAssociatedData(
+        string senderId,
+        string? targetId,
+        string sessionId,
+        ulong counter)
+        => System.Text.Encoding.UTF8.GetBytes(string.Join('\n',
+        [
+            CryptoVersionEcdhAesGcm2,
+            PacketType.Message.ToString(),
+            sessionId,
+            senderId,
+            targetId ?? string.Empty,
+            counter.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        ]));
 
     private string Encrypt(string plainText)
     {

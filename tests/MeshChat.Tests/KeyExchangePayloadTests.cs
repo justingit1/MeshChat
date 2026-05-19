@@ -84,6 +84,11 @@ public sealed class KeyExchangePayloadTests
             Payload = """{"Content":"hello"}""",
             IsEncrypted = true,
             CryptoVersion = "AESGCM1",
+            CryptoSessionId = "session-1",
+            CryptoKeyId = "key-1",
+            CryptoNonce = "nonce",
+            CryptoTag = "tag",
+            CryptoMessageCounter = 7,
             TcpPort = 45678,
             KnownPeers = [new PeerInfo { Id = "bob", Name = "Bob" }]
         };
@@ -103,6 +108,11 @@ public sealed class KeyExchangePayloadTests
         Assert.Equal(packet.Payload, deserialized.Payload);
         Assert.Equal(packet.IsEncrypted, deserialized.IsEncrypted);
         Assert.Equal(packet.CryptoVersion, deserialized.CryptoVersion);
+        Assert.Equal(packet.CryptoSessionId, deserialized.CryptoSessionId);
+        Assert.Equal(packet.CryptoKeyId, deserialized.CryptoKeyId);
+        Assert.Equal(packet.CryptoNonce, deserialized.CryptoNonce);
+        Assert.Equal(packet.CryptoTag, deserialized.CryptoTag);
+        Assert.Equal(packet.CryptoMessageCounter, deserialized.CryptoMessageCounter);
         Assert.Equal(packet.TcpPort, deserialized.TcpPort);
         Assert.NotNull(deserialized.KnownPeers);
         Assert.Single(deserialized.KnownPeers);

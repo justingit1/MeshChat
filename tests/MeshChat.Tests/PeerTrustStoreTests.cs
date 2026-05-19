@@ -65,6 +65,21 @@ public sealed class PeerTrustStoreTests
     }
 
     [Fact]
+    public void UpsertPeerIdentity_ChangedVerifiedIdentityResetsTrust()
+    {
+        var store = new PeerTrustStore(CreateTempFilePath());
+        store.UpsertPeerIdentity("peer-1", "Alice", [1, 2, 3], "abcdef");
+        store.MarkVerified("peer-1", new DateTime(2026, 05, 18, 13, 0, 0, DateTimeKind.Utc));
+
+        var peer = store.UpsertPeerIdentity("peer-1", "Alice", [4, 5, 6], "123456");
+
+        Assert.Equal(TrustState.Unknown, peer.TrustState);
+        Assert.Null(peer.VerifiedAt);
+        Assert.Equal("123456", peer.Fingerprint);
+        Assert.Equal([4, 5, 6], peer.IdentityPublicKey);
+    }
+
+    [Fact]
     public void MarkBlocked_SetsBlockedStateAndClearsVerifiedAt()
     {
         var store = new PeerTrustStore(CreateTempFilePath());

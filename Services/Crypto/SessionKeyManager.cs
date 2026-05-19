@@ -9,7 +9,7 @@ namespace MeshChat.Services.Crypto;
 public sealed class SessionKeyManager : IDisposable
 {
     public const string ProtocolVersion = "MESHCHAT-ECDH-P256-HKDF-SHA256-AESGCM-V1";
-    public const string CryptoVersion = "AESGCM1";
+    public const string CryptoVersion = "ECDH_AESGCM2";
 
     private static readonly TimeSpan DefaultSessionLifetime = TimeSpan.FromMinutes(10);
 
@@ -193,6 +193,61 @@ public sealed class SessionKeyManager : IDisposable
             return _sessionsByPeerId.TryGetValue(peerId, out var session) && _utcNow() < session.ExpiresAt
                 ? CloneSession(session)
                 : null;
+        }
+    }
+
+    public bool TryReserveNextSendMessageCounter(
+        string peerId,
+        out PeerCryptoSession? session,
+        out ulong counter)
+    {
+        ThrowIfDisposed();
+
+        lock (_lock)
+        {
+            session = null;
+            counter = 0;
+
+            if (!_sessionsByPeerId.TryGetValue(peerId, out var current) ||
+                _utcNow() >= current.ExpiresAt ||
+                current.SendMessageCounter == ulong.MaxValue)
+            {
+                return false;
+            }
+
+            counter = current.SendMessageCounter + 1;
+            var updated = current with { SendMessageCounter = counter };
+            _sessionsByPeerId[peerId] = updated;
+            session = CloneSession(updated);
+            return true;
+        }
+    }
+
+    public bool TryAdvanceReceiveMessageCounter(
+        string peerId,
+        string sessionId,
+        ulong counter,
+        out ulong lastSeenCounter)
+    {
+        ThrowIfDisposed();
+
+        lock (_lock)
+        {
+            lastSeenCounter = 0;
+
+            if (!_sessionsByPeerId.TryGetValue(peerId, out var current) ||
+                _utcNow() >= current.ExpiresAt ||
+                !current.SessionId.Equals(sessionId, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            lastSeenCounter = current.ReceiveMessageCounter;
+            if (counter <= current.ReceiveMessageCounter)
+                return false;
+
+            _sessionsByPeerId[peerId] = current with { ReceiveMessageCounter = counter };
+            return true;
         }
     }
 

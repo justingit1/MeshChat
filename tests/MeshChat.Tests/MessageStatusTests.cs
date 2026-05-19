@@ -102,6 +102,28 @@ public sealed class MessageStatusTests
     }
 
     [Fact]
+    public async Task SendMessageAsync_BlockedPeer_DoesNotSendDirectMessage()
+    {
+        var wifi = new FakeNetworkService { LocalId = "local" };
+        var bluetooth = new FakeNetworkService { LocalId = "local" };
+        var vm = CreateViewModel(wifi, bluetooth, new Peer
+        {
+            Id = "peer",
+            DisplayName = "Peer",
+            Status = PeerStatus.Online,
+            Transport = TransportType.WiFi,
+            HopsAway = 1
+        });
+        vm.BlockSelectedPeer();
+
+        await vm.SendMessageAsync();
+
+        Assert.Empty(vm.Messages);
+        Assert.Empty(wifi.Sends);
+        Assert.Contains("blocked", vm.ToastMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task SendMessageAsync_NoAck_RetriesWithSameChatMessageIdAndFreshPacketIds()
     {
         var wifi = new FakeNetworkService { LocalId = "local" };
@@ -356,6 +378,149 @@ public sealed class MessageStatusTests
     }
 
     [Fact]
+    public async Task QueuedTextMessage_BlockedPeerDoesNotResend()
+    {
+        var wifi = new FakeNetworkService { LocalId = "local" };
+        var bluetooth = new FakeNetworkService { LocalId = "local" };
+        var vm = CreateViewModel(wifi, bluetooth, new Peer
+        {
+            Id = "peer",
+            DisplayName = "Peer",
+            Status = PeerStatus.Online,
+            Transport = TransportType.WiFi,
+            HopsAway = 1
+        });
+        vm.BlockSelectedPeer();
+        var queued = new ChatMessage
+        {
+            SenderId = "local",
+            SenderName = "Local",
+            Content = "hello",
+            Type = MessageType.Text,
+            Status = MessageStatus.Failed,
+            ConversationId = "peer",
+            TargetPeerId = "peer",
+            QueuedAt = DateTime.UtcNow
+        };
+        AddMessageToHistory(vm, "peer", queued);
+        vm.Messages.Add(queued);
+
+        InvokePeerDiscovered(vm, new Peer
+        {
+            Id = "peer",
+            DisplayName = "Peer",
+            Status = PeerStatus.Online,
+            Transport = TransportType.WiFi,
+            HopsAway = 1
+        });
+        await Task.Delay(150);
+
+        Assert.Empty(wifi.Sends);
+        Assert.Equal(MessageStatus.Failed, Assert.Single(vm.Messages).Status);
+    }
+
+    [Fact]
+    public async Task HandleIncomingMessageAsync_BlockedDirectMessage_DropsWithoutAck()
+    {
+        var wifi = new FakeNetworkService { LocalId = "local" };
+        var bluetooth = new FakeNetworkService { LocalId = "local" };
+        var vm = CreateViewModel(wifi, bluetooth, new Peer
+        {
+            Id = "peer",
+            DisplayName = "Peer",
+            Status = PeerStatus.Online,
+            Transport = TransportType.WiFi,
+            HopsAway = 1
+        });
+        vm.BlockSelectedPeer();
+
+        await InvokeIncomingMessageAsync(vm, CreateIncomingPacket(CreateIncomingMessage("message-1")));
+
+        Assert.Empty(vm.Messages);
+        Assert.Empty(wifi.Sends);
+        Assert.Empty(GetMessageHistory(vm));
+    }
+
+    [Fact]
+    public void OnPacketReceived_BlockedTargetedReceipt_DoesNotAdvanceMessageStatus()
+    {
+        var wifi = new FakeNetworkService { LocalId = "local" };
+        var bluetooth = new FakeNetworkService { LocalId = "local" };
+        var vm = CreateViewModel(wifi, bluetooth, new Peer
+        {
+            Id = "peer",
+            DisplayName = "Peer",
+            Status = PeerStatus.Online,
+            Transport = TransportType.WiFi,
+            HopsAway = 1
+        });
+        var message = new ChatMessage
+        {
+            SenderId = "local",
+            SenderName = "Local",
+            Content = "hello",
+            Type = MessageType.Text,
+            Status = MessageStatus.Sent,
+            ConversationId = "peer",
+            TargetPeerId = "peer"
+        };
+        AddMessageToHistory(vm, "peer", message);
+        vm.Messages.Add(message);
+        vm.BlockSelectedPeer();
+
+        InvokePacketReceived(vm, new NetworkPacket
+        {
+            Type = PacketType.MessageAck,
+            SenderId = "peer",
+            SenderName = "Peer",
+            TargetId = "local",
+            Payload = message.Id
+        });
+
+        Assert.Equal(MessageStatus.Sent, Assert.Single(vm.Messages).Status);
+    }
+
+    [Theory]
+    [InlineData(PacketType.MessageAck)]
+    [InlineData(PacketType.ReadReceipt)]
+    public void OnPacketReceived_BlockedUntargetedReceipt_DoesNotAdvanceMessageStatus(PacketType packetType)
+    {
+        var wifi = new FakeNetworkService { LocalId = "local" };
+        var bluetooth = new FakeNetworkService { LocalId = "local" };
+        var vm = CreateViewModel(wifi, bluetooth, new Peer
+        {
+            Id = "peer",
+            DisplayName = "Peer",
+            Status = PeerStatus.Online,
+            Transport = TransportType.WiFi,
+            HopsAway = 1
+        });
+        var message = new ChatMessage
+        {
+            SenderId = "local",
+            SenderName = "Local",
+            Content = "hello",
+            Type = MessageType.Text,
+            Status = MessageStatus.Sent,
+            ConversationId = "peer",
+            TargetPeerId = "peer"
+        };
+        AddMessageToHistory(vm, "peer", message);
+        vm.Messages.Add(message);
+        vm.BlockSelectedPeer();
+
+        InvokePacketReceived(vm, new NetworkPacket
+        {
+            Type = packetType,
+            SenderId = "peer",
+            SenderName = "Peer",
+            Payload = message.Id
+        });
+
+        Assert.Equal(MessageStatus.Sent, Assert.Single(vm.Messages).Status);
+    }
+
+    [Fact]
     public void Receipts_AdvanceStatusWithoutRegressingRead()
     {
         var wifi = new FakeNetworkService { LocalId = "local" };
@@ -483,11 +648,15 @@ public sealed class MessageStatusTests
         SetField(vm, "_dispatcher", Dispatcher.CurrentDispatcher);
         SetField(vm, "_messageStore", new MessageStore());
         SetField(vm, "_logger", NullLogger<MainViewModel>.Instance);
+        SetField(vm, "_peerTrustStore", new PeerTrustStore(CreateTempTrustStorePath()));
+        SetField(vm, "_loadPeerTrustStoreOnInitialize", false);
+        SetField(vm, "_peerTrustStoreLoaded", true);
         SetField(vm, "_messageHistory", new Dictionary<string, List<ChatMessage>>());
         SetField(vm, "_peerById", peers.ToDictionary(peer => peer.Id));
         SetField(vm, "_messageById", new Dictionary<string, ChatMessage>());
         SetField(vm, "_reactionUsersByMessage", new Dictionary<string, Dictionary<string, HashSet<string>>>());
         SetField(vm, "_ackRetryCancellations", new Dictionary<string, CancellationTokenSource>());
+        SetField(vm, "_keyExchangeInFlight", new HashSet<string>());
         SetField(vm, "_queuedSendInFlight", new HashSet<string>());
         SetField(vm, "_ackRetryLock", new object());
         SetField(vm, "_queuedSendLock", new object());
@@ -519,6 +688,13 @@ public sealed class MessageStatusTests
     }
 
     private static CancellationTokenSource RetryLifetime() => new();
+
+    private static string CreateTempTrustStorePath()
+        => Path.Combine(
+            Path.GetTempPath(),
+            "MeshChatMessageStatusTests",
+            Guid.NewGuid().ToString("N"),
+            "trusted-peers.json");
 
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
@@ -593,6 +769,15 @@ public sealed class MessageStatusTests
 
         var task = (Task)method.Invoke(vm, [packet, CancellationToken.None])!;
         await task;
+    }
+
+    private static void InvokePacketReceived(MainViewModel vm, NetworkPacket packet)
+    {
+        var method = typeof(MainViewModel).GetMethod(
+            "OnPacketReceived",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        method.Invoke(vm, [packet]);
     }
 
     private static void InvokePeerDiscovered(MainViewModel vm, Peer peer)

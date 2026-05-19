@@ -57,6 +57,9 @@ public record Peer
     public string? RelayPeerId { get; init; }
     public DateTime LastSeen { get; init; } = DateTime.Now;
     public int UnreadCount { get; init; }
+    public TrustState TrustState { get; init; } = TrustState.Unknown;
+    public string FingerprintShort { get; init; } = string.Empty;
+    public string SecurityStatus { get; init; } = "Unverified";
 
     public bool IsDirectlyConnected => HopsAway == 1;
     public string HopDescription => HopsAway == 1 ? "Direct" : $"Via {HopsAway - 1} relay";

@@ -51,6 +51,11 @@ public sealed class NetworkPacketBehaviorTests
             Payload = "AESGCM1:payload",
             IsEncrypted = true,
             CryptoVersion = "AESGCM1",
+            CryptoSessionId = "session-1",
+            CryptoKeyId = "key-1",
+            CryptoNonce = "nonce",
+            CryptoTag = "tag",
+            CryptoMessageCounter = 7,
             TcpPort = 45678,
             KnownPeers = knownPeers
         };
@@ -68,6 +73,11 @@ public sealed class NetworkPacketBehaviorTests
         Assert.Equal(original.Payload, clone.Payload);
         Assert.True(clone.IsEncrypted);
         Assert.Equal("AESGCM1", clone.CryptoVersion);
+        Assert.Equal("session-1", clone.CryptoSessionId);
+        Assert.Equal("key-1", clone.CryptoKeyId);
+        Assert.Equal("nonce", clone.CryptoNonce);
+        Assert.Equal("tag", clone.CryptoTag);
+        Assert.Equal((ulong)7, clone.CryptoMessageCounter);
         Assert.Equal(original.TcpPort, clone.TcpPort);
         Assert.Same(knownPeers, clone.KnownPeers);
 

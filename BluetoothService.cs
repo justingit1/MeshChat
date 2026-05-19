@@ -268,6 +268,11 @@ public class BluetoothService : INetworkService
             Payload = packet.Payload,
             IsEncrypted = packet.IsEncrypted,
             CryptoVersion = packet.CryptoVersion,
+            CryptoSessionId = packet.CryptoSessionId,
+            CryptoKeyId = packet.CryptoKeyId,
+            CryptoNonce = packet.CryptoNonce,
+            CryptoTag = packet.CryptoTag,
+            CryptoMessageCounter = packet.CryptoMessageCounter,
             TcpPort = packet.TcpPort,
             KnownPeers = packet.KnownPeers
         };

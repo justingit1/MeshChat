@@ -37,6 +37,11 @@ public class NetworkPacket
     public string? Payload { get; set; }         // JSON string of actual data
     public bool IsEncrypted { get; set; }
     public string? CryptoVersion { get; set; }
+    public string? CryptoSessionId { get; set; }
+    public string? CryptoKeyId { get; set; }
+    public string? CryptoNonce { get; set; }
+    public string? CryptoTag { get; set; }
+    public ulong? CryptoMessageCounter { get; set; }
     public int TcpPort { get; set; }             // sender's listening port (for Hello)
 
     // Peer list for mesh discovery

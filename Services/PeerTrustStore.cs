@@ -143,8 +143,39 @@ public sealed class PeerTrustStore
     public TrustedPeer? MarkVerified(string peerId, DateTime? verifiedAt = null)
         => UpdateTrustState(peerId, TrustState.Verified, verifiedAt ?? DateTime.UtcNow);
 
-    public TrustedPeer? MarkBlocked(string peerId)
-        => UpdateTrustState(peerId, TrustState.Blocked, null);
+    public TrustedPeer MarkBlocked(string peerId, string displayName = "")
+    {
+        if (string.IsNullOrWhiteSpace(peerId))
+            throw new ArgumentException("Peer ID is required.", nameof(peerId));
+
+        lock (_lock)
+        {
+            if (_peers.TryGetValue(peerId, out var existing))
+            {
+                var updated = existing with
+                {
+                    TrustState = TrustState.Blocked,
+                    VerifiedAt = null
+                };
+
+                _peers[peerId] = updated;
+                return updated;
+            }
+
+            var now = DateTime.UtcNow;
+            var created = new TrustedPeer
+            {
+                PeerId = peerId,
+                DisplayName = displayName,
+                TrustState = TrustState.Blocked,
+                FirstSeen = now,
+                LastSeen = now
+            };
+
+            _peers[peerId] = created;
+            return created;
+        }
+    }
 
     public TrustedPeer? Unblock(string peerId)
         => UpdateTrustState(peerId, TrustState.Unknown, null);

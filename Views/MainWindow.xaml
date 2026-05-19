@@ -282,6 +282,11 @@
                                                        Foreground="{StaticResource TextSecondaryBrush}"
                                                        FontSize="11"
                                                        Margin="0,2,0,0"/>
+                                            <TextBlock Text="{Binding SecurityStatus}"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                       FontSize="11"
+                                                       TextTrimming="CharacterEllipsis"
+                                                       Margin="0,2,0,0"/>
                                         </StackPanel>
 
                                         <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right">
@@ -385,7 +390,7 @@
                                            Foreground="{StaticResource TextPrimaryBrush}"
                                            FontSize="16"
                                            FontWeight="SemiBold"/>
-                                <TextBlock Text="{Binding SelectedPeer.HopDescription, TargetNullValue='Messages sent here are broadcast to the mesh', FallbackValue='Messages sent here are broadcast to the mesh'}"
+                                <TextBlock Text="{Binding SelectedPeerSecurityStatus, TargetNullValue='Messages sent here are broadcast to the mesh', FallbackValue='Messages sent here are broadcast to the mesh'}"
                                            Foreground="{StaticResource TextSecondaryBrush}"
                                            FontSize="12"
                                            Margin="0,4,0,0"/>
