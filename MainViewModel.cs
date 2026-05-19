@@ -15,8 +15,10 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using MeshChat.Models;
 using MeshChat.Services;
+using MeshChat.Services.Crypto;
 using Newtonsoft.Json;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using LogLevel = MeshChat.Models.LogLevel;
@@ -35,6 +37,13 @@ public partial class MainViewModel : ObservableObject
     private readonly Dispatcher _dispatcher;
     private readonly MessageStore _messageStore;
     private readonly ILogger<MainViewModel> _logger;
+    private readonly LocalIdentityStore _localIdentityStore;
+    private readonly PeerTrustStore _peerTrustStore;
+    private readonly bool _loadPeerTrustStoreOnInitialize;
+    private LocalIdentity? _localIdentity;
+    private SessionKeyManager? _sessionKeyManager;
+    private bool _ownsLocalIdentity;
+    private bool _peerTrustStoreLoaded;
 
     // ─── Observable State ───────────────────────────────────────────────────
 
@@ -263,6 +272,7 @@ public partial class MainViewModel : ObservableObject
     private readonly Dictionary<string, ChatMessage> _messageById = [];
     private readonly Dictionary<string, Dictionary<string, HashSet<string>>> _reactionUsersByMessage = [];
     private readonly Dictionary<string, CancellationTokenSource> _ackRetryCancellations = [];
+    private readonly HashSet<string> _keyExchangeInFlight = [];
     private readonly HashSet<string> _queuedSendInFlight = [];
     private readonly object _ackRetryLock = new();
     private readonly object _queuedSendLock = new();
@@ -623,14 +633,23 @@ public partial class MainViewModel : ObservableObject
         INetworkService bluetooth,
         IFileTransferService fileTransfer,
         MessageStore messageStore,
-        ILogger<MainViewModel>? logger = null)
+        ILogger<MainViewModel>? logger = null,
+        LocalIdentityStore? localIdentityStore = null,
+        PeerTrustStore? peerTrustStore = null,
+        LocalIdentity? localIdentity = null,
+        SessionKeyManager? sessionKeyManager = null)
     {
-        _dispatcher = Application.Current.Dispatcher;
+        _dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
         _wifi = wifi;
         _bluetooth = bluetooth;
         _fileTransfer = fileTransfer;
         _messageStore = messageStore;
         _logger = logger ?? NullLogger<MainViewModel>.Instance;
+        _localIdentityStore = localIdentityStore ?? new LocalIdentityStore();
+        _peerTrustStore = peerTrustStore ?? new PeerTrustStore();
+        _loadPeerTrustStoreOnInitialize = peerTrustStore == null;
+        _localIdentity = localIdentity;
+        _sessionKeyManager = sessionKeyManager;
 
         FilteredMessages = CollectionViewSource.GetDefaultView(Messages);
         FilteredMessages.Filter = FilterMessage;
@@ -673,6 +692,7 @@ public partial class MainViewModel : ObservableObject
             if (_persistedMessagesLoaded)
                 return;
 
+            EnsureSessionKeyManager();
             await LoadPersistedMessagesAsync(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             _persistedMessagesLoaded = true;
@@ -751,6 +771,14 @@ public partial class MainViewModel : ObservableObject
 
         _lifetimeCts.Cancel();
         CancelAllAckRetries();
+        _sessionKeyManager?.Dispose();
+        _sessionKeyManager = null;
+        if (_ownsLocalIdentity)
+        {
+            _localIdentity?.Dispose();
+            _localIdentity = null;
+            _ownsLocalIdentity = false;
+        }
         await _wifi.StopAsync();
         await _bluetooth.StopAsync();
     }
@@ -923,6 +951,7 @@ public partial class MainViewModel : ObservableObject
                 if (shouldPromoteToDirect)
                 {
                     SendPeerListToPeer(peer);
+                    _ = StartKeyExchangeIfNeededAsync(peer, _lifetimeCts.Token);
                     TryResendQueuedTextMessages();
                     return;
                 }
@@ -932,7 +961,10 @@ public partial class MainViewModel : ObservableObject
             }
 
             if (peer.IsDirectlyConnected)
+            {
                 SendPeerListToPeer(peer);
+                _ = StartKeyExchangeIfNeededAsync(peer, _lifetimeCts.Token);
+            }
 
             TryResendQueuedTextMessages();
         });
@@ -1019,6 +1051,18 @@ public partial class MainViewModel : ObservableObject
                     HandleIncomingReaction(packet);
                     break;
 
+                case PacketType.KeyExchangeInit:
+                    _ = HandleKeyExchangeInitAsync(packet, _lifetimeCts.Token);
+                    break;
+
+                case PacketType.KeyExchangeResponse:
+                    _ = HandleKeyExchangeResponseAsync(packet, _lifetimeCts.Token);
+                    break;
+
+                case PacketType.KeyExchangeConfirm:
+                    HandleKeyExchangeConfirm(packet);
+                    break;
+
                 case PacketType.Hello:
                 case PacketType.HelloAck:
                     // Transport services handle handshake packets before application delivery.
@@ -1051,6 +1095,213 @@ public partial class MainViewModel : ObservableObject
 
         _ = SendToPeerViaTransportAsync(peer.Id, packet, _lifetimeCts.Token);
     }
+
+    private async Task StartKeyExchangeIfNeededAsync(Peer peer, CancellationToken cancellationToken)
+    {
+        if (!peer.IsDirectlyConnected || peer.Id == _wifi.LocalId)
+            return;
+
+        if (IsPeerBlocked(peer.Id))
+        {
+            AddLog($"[KeyExchange] Rejected key exchange with blocked peer {peer.DisplayName}", LogLevel.Warning);
+            return;
+        }
+
+        var manager = EnsureSessionKeyManager();
+        if (manager.GetActiveSession(peer.Id) != null)
+            return;
+
+        lock (_keyExchangeInFlight)
+        {
+            if (!_keyExchangeInFlight.Add(peer.Id))
+                return;
+        }
+
+        try
+        {
+            var payload = manager.CreateOutboundKeyExchangeInit(peer.Id);
+            var packet = CreateKeyExchangePacket(PacketType.KeyExchangeInit, peer.Id, payload);
+            await SendToPeerViaTransportAsync(peer.Id, packet, cancellationToken);
+            AddLog($"[KeyExchange] Started with {peer.DisplayName}", LogLevel.Info);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            lock (_keyExchangeInFlight)
+            {
+                _keyExchangeInFlight.Remove(peer.Id);
+            }
+
+            AddLog($"[KeyExchange] Failed to start with {peer.DisplayName}: {ex.Message}", LogLevel.Warning);
+            _logger.LogWarning(ex, "Key exchange start failed for {PeerId}", peer.Id);
+        }
+    }
+
+    private async Task HandleKeyExchangeInitAsync(NetworkPacket packet, CancellationToken cancellationToken)
+    {
+        if (!TryDeserializeKeyExchangePayload<KeyExchangeInitPayload>(packet, out var payload))
+            return;
+
+        var peerName = GetPeerDisplayName(packet);
+        try
+        {
+            if (!TryPrepareInboundKeyExchange(packet, payload, peerName))
+                return;
+
+            var response = EnsureSessionKeyManager().ProcessInboundKeyExchangeInit(payload);
+            var responsePacket = CreateKeyExchangePacket(PacketType.KeyExchangeResponse, payload.SenderPeerId, response);
+            await SendToPeerViaTransportAsync(payload.SenderPeerId, responsePacket, cancellationToken);
+            AddLog($"[KeyExchange] Started by {peerName}; response sent", LogLevel.Info);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            AddLog($"[KeyExchange] Rejected init from {peerName}: {ex.Message}", LogLevel.Warning);
+            _logger.LogWarning(ex, "Key exchange init rejected from {PeerId}", packet.SenderId);
+        }
+    }
+
+    private async Task HandleKeyExchangeResponseAsync(NetworkPacket packet, CancellationToken cancellationToken)
+    {
+        if (!TryDeserializeKeyExchangePayload<KeyExchangeResponsePayload>(packet, out var payload))
+            return;
+
+        var peerName = GetPeerDisplayName(packet);
+        try
+        {
+            if (!TryPrepareInboundKeyExchange(packet, payload, peerName))
+                return;
+
+            var confirm = EnsureSessionKeyManager().ProcessInboundKeyExchangeResponse(payload);
+            var confirmPacket = CreateKeyExchangePacket(PacketType.KeyExchangeConfirm, payload.SenderPeerId, confirm);
+            await SendToPeerViaTransportAsync(payload.SenderPeerId, confirmPacket, cancellationToken);
+            lock (_keyExchangeInFlight)
+            {
+                _keyExchangeInFlight.Remove(payload.SenderPeerId);
+            }
+
+            AddLog($"[KeyExchange] Established with {peerName}", LogLevel.Success);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            lock (_keyExchangeInFlight)
+            {
+                _keyExchangeInFlight.Remove(payload.SenderPeerId);
+            }
+
+            AddLog($"[KeyExchange] Failed with {peerName}: {ex.Message}", LogLevel.Warning);
+            _logger.LogWarning(ex, "Key exchange response failed from {PeerId}", packet.SenderId);
+        }
+    }
+
+    private void HandleKeyExchangeConfirm(NetworkPacket packet)
+    {
+        if (!TryDeserializeKeyExchangePayload<KeyExchangeConfirmPayload>(packet, out var payload))
+            return;
+
+        var peerName = GetPeerDisplayName(packet);
+        try
+        {
+            if (!TryPrepareInboundKeyExchange(packet, payload, peerName))
+                return;
+
+            EnsureSessionKeyManager().ProcessInboundKeyExchangeConfirm(payload);
+            lock (_keyExchangeInFlight)
+            {
+                _keyExchangeInFlight.Remove(payload.SenderPeerId);
+            }
+
+            AddLog($"[KeyExchange] Established with {peerName}", LogLevel.Success);
+        }
+        catch (Exception ex)
+        {
+            AddLog($"[KeyExchange] Failed confirm from {peerName}: {ex.Message}", LogLevel.Warning);
+            _logger.LogWarning(ex, "Key exchange confirm failed from {PeerId}", packet.SenderId);
+        }
+    }
+
+    private bool TryPrepareInboundKeyExchange(NetworkPacket packet, KeyExchangePayload payload, string peerName)
+    {
+        if (string.IsNullOrWhiteSpace(packet.SenderId) ||
+            !packet.SenderId.Equals(payload.SenderPeerId, StringComparison.Ordinal))
+        {
+            AddLog($"[KeyExchange] Rejected packet from {peerName}: sender mismatch", LogLevel.Warning);
+            return false;
+        }
+
+        if (IsPeerBlocked(payload.SenderPeerId))
+        {
+            AddLog($"[KeyExchange] Rejected blocked peer {peerName}", LogLevel.Warning);
+            return false;
+        }
+
+        var fingerprint = CryptoEncoding.ToHex(SHA256.HashData(payload.IdentityPublicKey));
+        _peerTrustStore.UpsertPeerIdentity(
+            payload.SenderPeerId,
+            peerName,
+            payload.IdentityPublicKey,
+            fingerprint);
+        _peerTrustStore.Save();
+        return true;
+    }
+
+    private bool TryDeserializeKeyExchangePayload<TPayload>(NetworkPacket packet, out TPayload payload)
+        where TPayload : KeyExchangePayload
+    {
+        payload = null!;
+
+        if (string.IsNullOrWhiteSpace(packet.Payload))
+        {
+            AddLog($"[KeyExchange] Rejected {packet.Type} from {GetPeerDisplayName(packet)}: missing payload", LogLevel.Warning);
+            return false;
+        }
+
+        try
+        {
+            payload = JsonConvert.DeserializeObject<TPayload>(packet.Payload)
+                ?? throw new JsonException("Key exchange payload was empty.");
+            return true;
+        }
+        catch (JsonException ex)
+        {
+            AddLog($"[KeyExchange] Rejected {packet.Type} from {GetPeerDisplayName(packet)}: invalid payload", LogLevel.Warning);
+            _logger.LogWarning(ex, "Invalid key exchange payload from {PeerId}", packet.SenderId);
+            return false;
+        }
+    }
+
+    private NetworkPacket CreateKeyExchangePacket(PacketType packetType, string targetPeerId, KeyExchangePayload payload)
+        => new()
+        {
+            Type = packetType,
+            SenderId = _wifi.LocalId,
+            SenderName = DisplayName,
+            TargetId = targetPeerId,
+            Payload = JsonConvert.SerializeObject(payload)
+        };
+
+    private SessionKeyManager EnsureSessionKeyManager()
+    {
+        if (!_peerTrustStoreLoaded)
+        {
+            if (_loadPeerTrustStoreOnInitialize)
+                _peerTrustStore.Load();
+            _peerTrustStoreLoaded = true;
+        }
+
+        if (_localIdentity == null)
+        {
+            _localIdentity = _localIdentityStore.LoadOrCreate();
+            _ownsLocalIdentity = true;
+        }
+
+        _sessionKeyManager ??= new SessionKeyManager(_wifi.LocalId, _localIdentity, _peerTrustStore);
+        return _sessionKeyManager;
+    }
+
+    private bool IsPeerBlocked(string peerId)
+        => _peerTrustStore.GetByPeerId(peerId)?.TrustState == TrustState.Blocked;
+
+    private string GetPeerDisplayName(NetworkPacket packet)
+        => string.IsNullOrWhiteSpace(packet.SenderName) ? packet.SenderId : packet.SenderName;
 
     private void MergePeerList(NetworkPacket packet)
     {

@@ -14,7 +14,10 @@ public enum PacketType
     PeerList,       // share known peers (mesh relay info)
     Goodbye,        // peer is leaving
     Typing,         // typing indicator
-    Reaction        // message reaction (emoji)
+    Reaction,       // message reaction (emoji)
+    KeyExchangeInit,
+    KeyExchangeResponse,
+    KeyExchangeConfirm
 }
 
 public class NetworkPacket
