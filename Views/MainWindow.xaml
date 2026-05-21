@@ -38,6 +38,8 @@
             <conv:TypingVisibilityConverter x:Key="TypingVis"/>
             <conv:LogEntryToInlinesConverter x:Key="LogInlines"/>
             <conv:StringToVisibilityConverter x:Key="StringToVisConverter"/>
+            <conv:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisConverter"/>
+            <conv:NonEmptyStringToBoolConverter x:Key="NonEmptyStringToBool"/>
             <conv:SignalBarColorConverter x:Key="BarColor"/>
             <conv:LastSeenTextConverter x:Key="LastSeenText"/>
             <conv:LastSeenVisibilityConverter x:Key="LastSeenVis"/>
@@ -109,18 +111,30 @@
                         </Border>
                         <StackPanel VerticalAlignment="Center">
                             <TextBlock Text="MeshChat" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}"/>
-                            <TextBlock Text="{Binding LocalId, StringFormat='ID {0}'}" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
+                            <TextBlock Text="{Binding LocalId, StringFormat='ID {0}'}"
+                                       FontSize="11"
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       MaxWidth="170"
+                                       TextTrimming="CharacterEllipsis"
+                                       ToolTip="{Binding LocalId, StringFormat='Local MeshChat ID: {0}'}"
+                                       AutomationProperties.Name="Local MeshChat ID"
+                                       AutomationProperties.HelpText="{Binding LocalId, StringFormat='Full local MeshChat ID: {0}'}"/>
                         </StackPanel>
                     </StackPanel>
 
                     <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
-                        <Border Background="{StaticResource PanelBrush}" CornerRadius="12" Padding="10,6" Margin="0,0,8,0">
+                        <Border Style="{StaticResource StatusBadge}"
+                                ToolTip="WiFi discovery and TCP transport are active"
+                                AutomationProperties.Name="WiFi transport active">
                             <StackPanel Orientation="Horizontal">
                                 <Ellipse Width="8" Height="8" Fill="{StaticResource AccentBrush}" Margin="0,0,7,0"/>
                                 <TextBlock Text="WiFi" Foreground="{StaticResource TextPrimaryBrush}" FontSize="12" FontWeight="SemiBold"/>
                             </StackPanel>
                         </Border>
-                        <Border Background="{StaticResource PanelBrush}" CornerRadius="12" Padding="10,6" Visibility="{Binding IsBluetoothAvailable, Converter={StaticResource BoolVis}}">
+                        <Border Style="{StaticResource StatusBadge}"
+                                Visibility="{Binding IsBluetoothAvailable, Converter={StaticResource BoolVis}}"
+                                ToolTip="Bluetooth transport is available"
+                                AutomationProperties.Name="Bluetooth transport available">
                             <StackPanel Orientation="Horizontal">
                                 <Ellipse Width="8" Height="8" Fill="{StaticResource BluetoothBrush}" Margin="0,0,7,0"/>
                                 <TextBlock Text="Bluetooth" Foreground="{StaticResource TextPrimaryBrush}" FontSize="12" FontWeight="SemiBold"/>
@@ -129,43 +143,60 @@
                     </StackPanel>
 
                     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                        <TextBox x:Name="SearchTextBox"
-                                 Width="150"
-                                 Margin="0,0,8,0"
-                                 Style="{StaticResource HeaderTextBox}"
-                                 Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
-                                 AutomationProperties.Name="Search messages"
-                                 ToolTip="Search messages"/>
-                        <Button Content="Clear"
-                                Margin="0,0,8,0"
-                                Click="ClearSearch_Click"
-                                Style="{StaticResource IconButton}"
-                                ToolTip="Clear search"/>
-                        <Button Content="Encrypt"
-                                Margin="0,0,8,0"
-                                Click="EncryptionToggle_Click"
-                                Style="{StaticResource IconButton}"
-                                ToolTip="Toggle encryption">
-                            <Button.Triggers>
-                                <EventTrigger RoutedEvent="Loaded"/>
-                            </Button.Triggers>
-                        </Button>
-                        <Button Content="Log"
-                                Margin="0,0,8,0"
-                                Click="LogToggleButton_Click"
-                                Style="{StaticResource LogToggleButton}"
-                                ToolTip="Toggle network log"/>
-                        <Button Content="_"
-                                Width="36"
-                                Margin="0,0,6,0"
-                                Click="MinimizeButton_Click"
-                                Style="{StaticResource IconButton}"
-                                ToolTip="Minimize"/>
-                        <Button Content="X"
-                                Width="36"
-                                Click="CloseButton_Click"
-                                Style="{StaticResource IconButton}"
-                                ToolTip="Close"/>
+                        <Border Style="{StaticResource CommandGroupBorder}">
+                            <Grid Width="196">
+                                <TextBox x:Name="SearchTextBox"
+                                         Style="{StaticResource HeaderTextBox}"
+                                         Padding="10,5,34,5"
+                                         Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
+                                         AutomationProperties.Name="Search messages"
+                                         ToolTip="Search messages (Ctrl+F)"/>
+                                <TextBlock Text="Search messages"
+                                           Foreground="{StaticResource TextMutedBrush}"
+                                           FontSize="12"
+                                           Margin="12,0"
+                                           VerticalAlignment="Center"
+                                           IsHitTestVisible="False"
+                                           Visibility="{Binding Text, ElementName=SearchTextBox, Converter={StaticResource EmptyStringToVisConverter}}"/>
+                                <Button HorizontalAlignment="Right"
+                                        VerticalAlignment="Center"
+                                        Margin="0,0,5,0"
+                                        Click="ClearSearch_Click"
+                                        Style="{StaticResource HeaderClearSearchButton}"
+                                        Visibility="{Binding IsSearchActive, Converter={StaticResource BoolVis}}"
+                                        AutomationProperties.Name="Clear message search"
+                                        AutomationProperties.HelpText="Clears the current message search only."
+                                        ToolTip="Clear message search (Esc)"/>
+                            </Grid>
+                        </Border>
+                        <Border Style="{StaticResource CommandGroupBorder}">
+                            <StackPanel Orientation="Horizontal">
+                                <ToggleButton IsChecked="{Binding EncryptionEnabled, Mode=TwoWay}"
+                                              Style="{StaticResource EncryptionToggleButton}"/>
+                            </StackPanel>
+                        </Border>
+                        <Border Style="{StaticResource CommandGroupBorder}">
+                            <ToggleButton IsChecked="{Binding IsNetworkLogVisible, Mode=TwoWay}"
+                                          Click="LogToggleButton_Click"
+                                          Style="{StaticResource LogToggleButton}"/>
+                        </Border>
+                        <Border Style="{StaticResource CommandGroupBorder}" Margin="0">
+                            <StackPanel Orientation="Horizontal">
+                                <Button Content="-"
+                                        Width="36"
+                                        Margin="0,0,4,0"
+                                        Click="MinimizeButton_Click"
+                                        Style="{StaticResource IconButton}"
+                                        AutomationProperties.Name="Minimize window"
+                                        ToolTip="Minimize window"/>
+                                <Button Content="X"
+                                        Width="36"
+                                        Click="CloseButton_Click"
+                                        Style="{StaticResource IconButton}"
+                                        AutomationProperties.Name="Close window"
+                                        ToolTip="Close window"/>
+                            </StackPanel>
+                        </Border>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -175,17 +206,19 @@
                     <ColumnDefinition Width="280"/>
                     <ColumnDefinition Width="4"/>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="280" x:Name="NetworkLogColumn"/>
+                    <ColumnDefinition Width="248" x:Name="NetworkLogColumn"/>
                 </Grid.ColumnDefinitions>
 
                 <!-- Sidebar spacing is intentionally fixed so peer rows do not shift as badges appear. -->
                 <Border x:Name="SidebarBorder"
                         Grid.Column="0"
-                        Background="{StaticResource SidebarBrush}"
-                        BorderBrush="{StaticResource BorderBrush}"
+                        Style="{StaticResource PanelShell}"
                         BorderThickness="0,0,1,0"
                         Padding="16"
                         Opacity="0">
+                    <Border.Effect>
+                        <DropShadowEffect BlurRadius="14" ShadowDepth="0" Opacity="0.16" Color="{StaticResource WindowShadowColor}"/>
+                    </Border.Effect>
                     <Border.RenderTransform>
                         <TranslateTransform/>
                     </Border.RenderTransform>
@@ -209,44 +242,53 @@
                                            Margin="0,2,0,0"/>
                             </StackPanel>
                             <Button Grid.Column="1"
-                                    Width="38"
+                                    MinWidth="88"
                                     Height="38"
+                                    Padding="10,6"
                                     Click="AddDeviceButton_Click"
                                     Style="{StaticResource IconButton}"
-                                    ToolTip="Add peer manually">
-                                <Border x:Name="PlusButtonBorder"
-                                        Width="20"
-                                        Height="20"
-                                        CornerRadius="10"
-                                        Background="{StaticResource AccentBrush}"
-                                        RenderTransformOrigin="0.5,0.5">
-                                    <Border.RenderTransform>
+                                    AutomationProperties.Name="Connect to peer manually"
+                                    ToolTip="Connect to peer manually by IP address">
+                                <StackPanel x:Name="PlusButtonBorder" Orientation="Horizontal" RenderTransformOrigin="0.5,0.5">
+                                    <StackPanel.RenderTransform>
                                         <ScaleTransform/>
-                                    </Border.RenderTransform>
-                                    <TextBlock Text="+"
-                                               Foreground="{StaticResource DarkButtonTextBrush}"
-                                               FontWeight="Bold"
-                                               HorizontalAlignment="Center"
+                                    </StackPanel.RenderTransform>
+                                    <Border Width="18"
+                                            Height="18"
+                                            CornerRadius="9"
+                                            Background="{StaticResource AccentBrush}"
+                                            Margin="0,0,7,0">
+                                        <TextBlock Text="+"
+                                                   Foreground="{StaticResource DarkButtonTextBrush}"
+                                                   FontWeight="Bold"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"/>
+                                    </Border>
+                                    <TextBlock Text="Manual"
+                                               Foreground="{StaticResource TextPrimaryBrush}"
+                                               FontSize="12"
+                                               FontWeight="SemiBold"
                                                VerticalAlignment="Center"/>
-                                </Border>
+                                </StackPanel>
                             </Button>
                         </Grid>
 
-                        <ListBox Grid.Row="1"
-                                 ItemsSource="{Binding Peers}"
-                                 SelectedItem="{Binding SelectedPeer}"
-                                 AutomationProperties.Name="Network peers"
-                                 ScrollViewer.CanContentScroll="True"
-                                 VirtualizingPanel.IsVirtualizing="True"
-                                 VirtualizingPanel.VirtualizationMode="Recycling">
-                            <ListBox.ItemTemplate>
-                                <DataTemplate DataType="{x:Type models:Peer}">
-                                    <Grid>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="44"/>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="Auto"/>
-                                        </Grid.ColumnDefinitions>
+                        <Grid Grid.Row="1">
+                            <ListBox x:Name="PeersList"
+                                     ItemsSource="{Binding Peers}"
+                                     SelectedItem="{Binding SelectedPeer}"
+                                     AutomationProperties.Name="Network peers"
+                                     ScrollViewer.CanContentScroll="True"
+                                     VirtualizingPanel.IsVirtualizing="True"
+                                     VirtualizingPanel.VirtualizationMode="Recycling">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate DataType="{x:Type models:Peer}">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="44"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
 
                                         <!-- Avatar gradients are converter-picked from the peer ID for stable user colors. -->
                                         <Border Grid.Column="0"
@@ -310,10 +352,64 @@
                                                            HorizontalAlignment="Center"/>
                                             </Border>
                                         </StackPanel>
-                                    </Grid>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+
+                            <Border Padding="18"
+                                    Background="{StaticResource ElevatedSurfaceBrush}"
+                                    BorderBrush="{StaticResource BorderBrush}"
+                                    BorderThickness="1"
+                                    CornerRadius="14"
+                                    VerticalAlignment="Top"
+                                    Margin="0,4,0,0"
+                                    AutomationProperties.Name="No peers yet"
+                                    AutomationProperties.HelpText="Start MeshChat on another device on the same WiFi, or use Manual to connect by IP address.">
+                                <Border.Effect>
+                                    <DropShadowEffect BlurRadius="12" ShadowDepth="0" Opacity="0.14" Color="{StaticResource WindowShadowColor}"/>
+                                </Border.Effect>
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ElementName=PeersList, Path=HasItems}" Value="True">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                                <StackPanel>
+                                    <TextBlock Text="No peers yet"
+                                               Foreground="{StaticResource TextPrimaryBrush}"
+                                               FontSize="14"
+                                               FontWeight="SemiBold"/>
+                                    <TextBlock Text="Start MeshChat on another device on the same WiFi, or use Manual to connect by IP address."
+                                               Foreground="{StaticResource TextMutedBrush}"
+                                               FontSize="12"
+                                               LineHeight="18"
+                                               TextWrapping="Wrap"
+                                               Margin="0,6,0,0"/>
+                                    <Expander x:Name="ConnectHelpExpander"
+                                              Margin="0,10,0,0"
+                                              Foreground="{StaticResource TextSecondaryBrush}"
+                                              AutomationProperties.Name="How to connect help">
+                                        <Expander.Header>
+                                            <TextBlock Text="How to connect"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                       FontSize="12"
+                                                       FontWeight="SemiBold"/>
+                                        </Expander.Header>
+                                        <TextBlock Text="- Start another MeshChat client on the same WiFi network.&#x0a;- Wait for auto-discovery to find it.&#x0a;- Use Manual if auto-discovery does not find the peer.&#x0a;- Bluetooth unavailable does not prevent WiFi mesh routing."
+                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                   FontSize="11"
+                                                   LineHeight="17"
+                                                   TextWrapping="Wrap"
+                                                   Margin="18,6,0,0"/>
+                                    </Expander>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
 
                         <Border x:Name="ManualConnectPanel"
                                 Grid.Row="2"
@@ -326,6 +422,9 @@
                                 CornerRadius="16"
                                 Padding="14"
                                 Margin="0,14,0,0">
+                            <Border.Effect>
+                                <DropShadowEffect BlurRadius="10" ShadowDepth="0" Opacity="0.13" Color="{StaticResource WindowShadowColor}"/>
+                            </Border.Effect>
                             <StackPanel>
                                 <TextBlock Text="Manual connect"
                                            Foreground="{StaticResource TextPrimaryBrush}"
@@ -342,17 +441,18 @@
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBox Grid.Column="0"
-                                             Text="{Binding ConnectPort, UpdateSourceTrigger=PropertyChanged}"
-                                             Style="{StaticResource TextBoxChrome}"
-                                             Margin="0,0,8,0"
-                                             AutomationProperties.Name="Port"
-                                             ToolTip="Port"/>
-                                    <Button Grid.Column="1"
-                                            Content="Connect"
-                                            Click="ConnectButton_Click"
-                                            Style="{StaticResource AccentButton}"
-                                            AutomationProperties.Name="Connect to device"/>
+                                     <TextBox Grid.Column="0"
+                                              Text="{Binding ConnectPort, UpdateSourceTrigger=PropertyChanged}"
+                                              Style="{StaticResource TextBoxChrome}"
+                                              Margin="0,0,8,0"
+                                              AutomationProperties.Name="Port"
+                                              ToolTip="Port"/>
+                                     <Button Grid.Column="1"
+                                             Content="Connect"
+                                             Click="ConnectButton_Click"
+                                             Style="{StaticResource AccentButton}"
+                                             AutomationProperties.Name="Connect to peer by IP address"
+                                             ToolTip="Connect to the peer at this IP address and port"/>
                                 </Grid>
                             </StackPanel>
                         </Border>
@@ -372,11 +472,11 @@
                         <RowDefinition Height="76"/>
                         <RowDefinition Height="*"/>
                         <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="88"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <Border Grid.Row="0"
-                            Background="{StaticResource AppBackgroundBrush}"
+                            Background="{StaticResource ElevatedSurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
                             BorderThickness="0,0,0,1"
                             Padding="22,12">
@@ -386,14 +486,16 @@
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel VerticalAlignment="Center">
-                                <TextBlock Text="{Binding SelectedPeer.DisplayName, TargetNullValue=Broadcast, FallbackValue=Broadcast}"
-                                           Foreground="{StaticResource TextPrimaryBrush}"
-                                           FontSize="16"
-                                           FontWeight="SemiBold"/>
-                                <TextBlock Text="{Binding SelectedPeerSecurityStatus, TargetNullValue='Messages sent here are broadcast to the mesh', FallbackValue='Messages sent here are broadcast to the mesh'}"
-                                           Foreground="{StaticResource TextSecondaryBrush}"
-                                           FontSize="12"
-                                           Margin="0,4,0,0"/>
+                                 <TextBlock Text="{Binding SelectedPeer.DisplayName, TargetNullValue=Broadcast, FallbackValue=Broadcast}"
+                                            Foreground="{StaticResource TextPrimaryBrush}"
+                                            FontSize="16"
+                                            FontWeight="SemiBold"
+                                            TextTrimming="CharacterEllipsis"/>
+                                 <TextBlock Text="{Binding SelectedPeerSecurityStatus, TargetNullValue='Mesh broadcast channel', FallbackValue='Mesh broadcast channel'}"
+                                            Foreground="{StaticResource TextSecondaryBrush}"
+                                            FontSize="12"
+                                            TextTrimming="CharacterEllipsis"
+                                            Margin="0,4,0,0"/>
                             </StackPanel>
                             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                                 <TextBlock Text="{Binding SelectedPeer.HopDescription}"
@@ -405,27 +507,29 @@
                                         Click="SendFileButton_Click"
                                         Style="{StaticResource ChromeButton}"
                                         IsEnabled="{Binding SelectedPeer, Converter={StaticResource NullToBool}}"
-                                        ToolTip="Attach a file"/>
+                                        ToolTip="Attach a file to the selected peer. Disabled in Broadcast."
+                                        ToolTipService.ShowOnDisabled="True"
+                                        AutomationProperties.Name="Attach file to selected peer"/>
                             </StackPanel>
                         </Grid>
                     </Border>
 
-                    <!-- Message virtualization requires the ListBox to own scrolling; wrapping it in a ScrollViewer would materialize every chat card. -->
-                    <ListBox x:Name="MessagesList"
-                             Grid.Row="1"
-                             Background="{StaticResource AppBackgroundBrush}"
-                             Padding="{StaticResource MessageListPadding}"
-                             ItemsSource="{Binding FilteredMessages}"
-                             ItemContainerStyle="{StaticResource MessageListItemStyle}"
-                             ScrollViewer.CanContentScroll="True"
-                             VirtualizingPanel.IsVirtualizing="True"
-                             VirtualizingPanel.VirtualizationMode="Recycling">
-                        <ListBox.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <VirtualizingStackPanel/>
-                            </ItemsPanelTemplate>
-                        </ListBox.ItemsPanel>
-                        <ListBox.ItemTemplate>
+                    <Grid Grid.Row="1">
+                        <!-- Message virtualization requires the ListBox to own scrolling; wrapping it in a ScrollViewer would materialize every chat card. -->
+                        <ListBox x:Name="MessagesList"
+                                 Background="{StaticResource AppBackgroundBrush}"
+                                 Padding="22,16,22,8"
+                                 ItemsSource="{Binding FilteredMessages}"
+                                 ItemContainerStyle="{StaticResource MessageListItemStyle}"
+                                 ScrollViewer.CanContentScroll="True"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListBox.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel/>
+                                </ItemsPanelTemplate>
+                            </ListBox.ItemsPanel>
+                            <ListBox.ItemTemplate>
                                 <DataTemplate DataType="{x:Type models:ChatMessage}">
                                     <Grid Margin="0,0,0,12">
                                         <Border Visibility="{Binding Type, Converter={StaticResource IsDateSepVis}}"
@@ -591,8 +695,72 @@
                                         </StackPanel>
                                     </Grid>
                                 </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <Border HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                MaxWidth="430"
+                                Background="{StaticResource ElevatedSurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="18"
+                                Padding="28,22"
+                                IsHitTestVisible="False"
+                                AutomationProperties.Name="{Binding EmptyMessagesTitle}">
+                            <Border.Effect>
+                                <DropShadowEffect BlurRadius="16" ShadowDepth="0" Opacity="0.16" Color="{StaticResource WindowShadowColor}"/>
+                            </Border.Effect>
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding FilteredMessages.IsEmpty}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <StackPanel>
+                                <Border Width="38"
+                                        Height="38"
+                                        CornerRadius="13"
+                                        Background="{StaticResource PanelBrush}"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="1"
+                                        HorizontalAlignment="Center"
+                                        Margin="0,0,0,12">
+                                    <Grid>
+                                        <Ellipse Width="13"
+                                                 Height="13"
+                                                 Fill="{StaticResource AccentBrush}"
+                                                 Opacity="0.9"
+                                                 HorizontalAlignment="Center"
+                                                 VerticalAlignment="Center"/>
+                                        <Ellipse Width="24"
+                                                 Height="24"
+                                                 Stroke="{StaticResource AccentBrush}"
+                                                 StrokeThickness="1"
+                                                 Opacity="0.35"
+                                                 HorizontalAlignment="Center"
+                                                 VerticalAlignment="Center"/>
+                                    </Grid>
+                                </Border>
+                                <TextBlock Text="{Binding EmptyMessagesTitle}"
+                                           Foreground="{StaticResource TextPrimaryBrush}"
+                                           FontSize="15"
+                                           FontWeight="SemiBold"
+                                           TextAlignment="Center"/>
+                                <TextBlock Text="{Binding EmptyMessagesDescription}"
+                                           Foreground="{StaticResource TextMutedBrush}"
+                                           FontSize="12"
+                                           LineHeight="18"
+                                           TextWrapping="Wrap"
+                                           TextAlignment="Center"
+                                           Margin="0,7,0,0"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
 
                     <Border Grid.Row="2"
                             Background="{StaticResource PanelBrush}"
@@ -600,7 +768,7 @@
                             BorderThickness="1"
                             CornerRadius="14"
                             Padding="12,8"
-                            Margin="22,0,22,10"
+                            Margin="22,0,22,8"
                             Visibility="{Binding IsPeerTyping, Converter={StaticResource TypingVis}}">
                         <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="12">
                             <Run Text="{Binding TypingPeerName}"/>
@@ -608,41 +776,77 @@
                         </TextBlock>
                     </Border>
 
-                    <!-- Input spacing leaves a clear target for keyboard focus and touch without crowding the message list. -->
-                    <Border Grid.Row="3"
-                            Background="{StaticResource InputBrush}"
-                            BorderBrush="{StaticResource BorderBrush}"
-                            BorderThickness="1,1,0,0"
-                            Padding="18">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="10"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBox x:Name="MessageTextBox"
-                                     Grid.Column="0"
-                                     Text="{Binding MessageInput, UpdateSourceTrigger=PropertyChanged}"
-                                     Style="{StaticResource TextBoxChrome}"
-                                     AcceptsReturn="False"
-                                     KeyDown="MessageInput_KeyDown"
-                                     AutomationProperties.Name="Message"
-                                     ToolTip="Message"/>
-                            <Button Grid.Column="2"
-                                    Click="SendButton_Click"
-                                    Style="{StaticResource SendButton}"
-                                    AutomationProperties.Name="Send message"
-                                    ToolTip="Send message"/>
-                        </Grid>
-                    </Border>
+                    <StackPanel Grid.Row="3" Margin="22,0,22,16">
+                        <TextBlock Text="No peers connected. Start another MeshChat client or connect manually."
+                                   Foreground="{StaticResource TextMutedBrush}"
+                                   FontSize="11"
+                                   TextWrapping="Wrap"
+                                   Margin="2,0,2,6"
+                                   AutomationProperties.Name="No peers connected">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ElementName=PeersList, Path=HasItems}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <!-- Input spacing leaves a clear target for keyboard focus and touch without crowding the message list. -->
+                        <Border Background="{StaticResource ComposerBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="16"
+                                Padding="12">
+                            <Border.Effect>
+                                <DropShadowEffect BlurRadius="18" ShadowDepth="0" Opacity="0.18" Color="{StaticResource WindowShadowColor}"/>
+                            </Border.Effect>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid Grid.Column="0">
+                                    <TextBox x:Name="MessageTextBox"
+                                             Text="{Binding MessageInput, UpdateSourceTrigger=PropertyChanged}"
+                                             Style="{StaticResource TextBoxChrome}"
+                                             AcceptsReturn="False"
+                                             KeyDown="MessageInput_KeyDown"
+                                             AutomationProperties.Name="Message"
+                                             ToolTip="Type a message. Press Enter to send."/>
+                                    <TextBlock Text="Message the mesh"
+                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                               FontSize="13"
+                                               Margin="14,0"
+                                               VerticalAlignment="Center"
+                                               IsHitTestVisible="False"
+                                               Visibility="{Binding Text, ElementName=MessageTextBox, Converter={StaticResource EmptyStringToVisConverter}}"/>
+                                </Grid>
+                                <Button Grid.Column="2"
+                                        Click="SendButton_Click"
+                                        Style="{StaticResource SendButton}"
+                                        IsEnabled="{Binding Text, ElementName=MessageTextBox, Converter={StaticResource NonEmptyStringToBool}}"
+                                        ToolTipService.ShowOnDisabled="True"
+                                        AutomationProperties.Name="Send message"
+                                        ToolTip="Type a message to enable Send. Press Enter to send."/>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
                 </Grid>
 
                 <Border x:Name="NetworkLogPanel"
                         Grid.Column="3"
-                        Background="{StaticResource SidebarBrush}"
+                        Background="{StaticResource LogPanelBrush}"
                         BorderBrush="{StaticResource BorderBrush}"
                         BorderThickness="1,0,0,0"
                         Width="0">
+                    <Border.Effect>
+                        <DropShadowEffect BlurRadius="12" ShadowDepth="0" Opacity="0.14" Color="{StaticResource WindowShadowColor}"/>
+                    </Border.Effect>
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -650,22 +854,26 @@
                         </Grid.RowDefinitions>
 
                         <Border Grid.Row="0"
-                                Background="{StaticResource HeaderBrush}"
+                                Background="{StaticResource ElevatedSurfaceBrush}"
                                 BorderBrush="{StaticResource BorderBrush}"
                                 BorderThickness="0,0,0,1"
-                                Padding="14">
+                                Padding="12">
                             <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
                                 <TextBlock Text="Network log"
                                            Foreground="{StaticResource TextPrimaryBrush}"
-                                           FontSize="16"
+                                           FontSize="13"
                                            FontWeight="SemiBold"
                                            VerticalAlignment="Center"/>
-                                <ComboBox ItemsSource="{Binding LogFilterOptions}"
+                                <ComboBox Grid.Column="1"
+                                          ItemsSource="{Binding LogFilterOptions}"
                                           SelectedItem="{Binding LogFilter}"
-                                          Width="104"
-                                          HorizontalAlignment="Right"
+                                          Width="96"
                                           AutomationProperties.Name="Activity log filter"
-                                          ToolTip="Activity log filter"/>
+                                          ToolTip="Filter network activity log entries"/>
                             </Grid>
                         </Border>
 
@@ -673,7 +881,8 @@
                         <ListBox Grid.Row="1"
                                  ItemsSource="{Binding FilteredLogs}"
                                  ItemContainerStyle="{StaticResource LogListItemStyle}"
-                                 Padding="12"
+                                 Padding="10"
+                                 Background="{StaticResource LogPanelBrush}"
                                  ScrollViewer.CanContentScroll="True"
                                  VirtualizingPanel.IsVirtualizing="True"
                                  VirtualizingPanel.VirtualizationMode="Recycling">
@@ -684,31 +893,78 @@
                             </ListBox.ItemsPanel>
                             <ListBox.ItemTemplate>
                                     <DataTemplate>
-                                        <Border Background="{StaticResource PanelBrush}"
-                                                BorderBrush="{StaticResource BorderBrush}"
-                                                BorderThickness="1"
-                                                CornerRadius="12"
-                                                Padding="11"
-                                                Margin="0,0,0,8">
-                                            <Grid>
-                                                <Grid.RowDefinitions>
-                                                    <RowDefinition Height="Auto"/>
-                                                    <RowDefinition Height="Auto"/>
-                                                </Grid.RowDefinitions>
-                                                <StackPanel Orientation="Horizontal">
-                                                    <Ellipse Width="7" Height="7" Fill="{Binding TagColor}" Margin="0,0,7,0" VerticalAlignment="Center"/>
-                                                    <TextBlock Text="{Binding Tag}" Foreground="{Binding TagColor}" FontSize="11" FontWeight="SemiBold"/>
-                                                    <TextBlock Text="{Binding Timestamp, StringFormat='  {0}'}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"/>
-                                                </StackPanel>
-                                                <TextBlock Grid.Row="1"
-                                                           Text="{Binding Message}"
-                                                           Foreground="{StaticResource TextPrimaryBrush}"
-                                                           FontSize="12"
-                                                           TextWrapping="Wrap"
-                                                           LineHeight="18"
-                                                           Margin="0,6,0,0"/>
-                                            </Grid>
-                                        </Border>
+                                        <Grid>
+                                            <Border Height="1"
+                                                    Background="{StaticResource BorderBrush}"
+                                                    Opacity="0.72"
+                                                    Margin="8,8,8,10">
+                                                <Border.Style>
+                                                    <Style TargetType="Border">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsSeparator}" Value="True">
+                                                                <Setter Property="Visibility" Value="Visible"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                            </Border>
+
+                                            <Border Background="{StaticResource LogEntryBrush}"
+                                                    BorderBrush="{StaticResource LogEntryBorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="8"
+                                                    Padding="8,7"
+                                                    Margin="0,0,0,4">
+                                                <Border.Style>
+                                                    <Style TargetType="Border">
+                                                        <Setter Property="Visibility" Value="Visible"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsSeparator}" Value="True">
+                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="4"/>
+                                                        <ColumnDefinition Width="8"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <Border Grid.Column="0"
+                                                            Width="3"
+                                                            CornerRadius="2"
+                                                            Background="{Binding TagColor}"
+                                                            ToolTip="{Binding Tag}"/>
+                                                    <Grid Grid.Column="2">
+                                                        <Grid.RowDefinitions>
+                                                            <RowDefinition Height="Auto"/>
+                                                            <RowDefinition Height="Auto"/>
+                                                        </Grid.RowDefinitions>
+                                                        <DockPanel LastChildFill="True">
+                                                            <TextBlock DockPanel.Dock="Right"
+                                                                       Text="{Binding Timestamp}"
+                                                                       Foreground="{StaticResource TextMutedBrush}"
+                                                                       FontSize="10"
+                                                                       Margin="8,0,0,0"/>
+                                                            <TextBlock Text="{Binding Tag, TargetNullValue=Info, FallbackValue=Info}"
+                                                                       Foreground="{Binding TagColor}"
+                                                                       FontSize="10"
+                                                                       FontWeight="SemiBold"
+                                                                       TextTrimming="CharacterEllipsis"/>
+                                                        </DockPanel>
+                                                        <TextBlock Grid.Row="1"
+                                                                   Text="{Binding Message}"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                                   FontSize="11"
+                                                                   TextWrapping="Wrap"
+                                                                   LineHeight="15"
+                                                                   Margin="0,3,0,0"/>
+                                                    </Grid>
+                                                </Grid>
+                                            </Border>
+                                        </Grid>
                                     </DataTemplate>
                             </ListBox.ItemTemplate>
                         </ListBox>
@@ -716,36 +972,32 @@
                 </Border>
             </Grid>
 
-            <!-- Status bar uses two explicit lines so transport and mesh routing remain readable at small widths. -->
+            <!-- Status bar stays single-line so DPI scaling and narrow windows do not wrap transport details. -->
             <Border Grid.Row="2"
                     Background="{StaticResource StatusBarBrush}"
                     BorderBrush="{StaticResource BorderBrush}"
                     BorderThickness="0,1,0,0"
                     CornerRadius="0,0,14,14"
-                    Padding="18,7">
+                    Padding="18,0">
                 <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="*"/>
-                        <RowDefinition Height="*"/>
-                    </Grid.RowDefinitions>
-                    <TextBlock Grid.Row="0"
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Border Width="8"
+                            Height="8"
+                            CornerRadius="4"
+                            Background="{StaticResource AccentBrush}"
+                            Margin="0,0,10,0"
+                            VerticalAlignment="Center"
+                            ToolTip="Online status indicator"
+                            AutomationProperties.Name="Online status indicator"/>
+                    <TextBlock Grid.Column="1"
                                Text="{Binding StatusText}"
                                Foreground="{StaticResource TextPrimaryBrush}"
                                FontSize="12"
                                TextTrimming="CharacterEllipsis"
                                VerticalAlignment="Center"/>
-                    <TextBlock Grid.Row="1"
-                               Foreground="{StaticResource TextPrimaryBrush}"
-                               FontSize="11"
-                               Opacity="0.86"
-                               TextTrimming="CharacterEllipsis"
-                               VerticalAlignment="Center">
-                        <Run Text="Transport: WiFi"/>
-                        <Run Text=" + Bluetooth when available"/>
-                        <Run Text=" | Mesh routing enabled"/>
-                        <Run Text=" | Port "/>
-                        <Run Text="{Binding ConnectPort}"/>
-                    </TextBlock>
                 </Grid>
             </Border>
         </Grid>

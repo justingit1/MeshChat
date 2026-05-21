@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
@@ -234,8 +235,10 @@ public class BluetoothService : INetworkService
         {
             if (peerId != null)
             {
-                _connections.TryRemove(peerId, out _);
-                if (IsRunning && !ct.IsCancellationRequested)
+                var removedCurrentConnection =
+                    ((ICollection<KeyValuePair<string, BluetoothClient>>)_connections)
+                    .Remove(new KeyValuePair<string, BluetoothClient>(peerId, client));
+                if (removedCurrentConnection && IsRunning && !ct.IsCancellationRequested)
                     PeerLost?.Invoke(peerId);
             }
             client.Dispose();

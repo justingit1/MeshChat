@@ -23,3 +23,9 @@ packages/
 .claude/*.local.json
 .claude/settings/.local.json
 .claude/**/*.local.json
+
+# Generated UI capture artifacts
+artifacts/**/*.png
+artifacts/**/manifest.json
+artifacts/**/localappdata/
+artifacts/**/localappdata-*/

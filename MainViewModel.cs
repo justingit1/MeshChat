@@ -52,7 +52,7 @@ public partial class MainViewModel : ObservableObject
     public BulkObservableCollection<LogEntry> Logs { get; } = [];
     public ICollectionView FilteredMessages { get; }
     public ICollectionView FilteredLogs { get; }
-    public string SelectedPeerSecurityStatus => SelectedPeer?.SecurityStatus ?? "Broadcast";
+    public string SelectedPeerSecurityStatus => SelectedPeer?.SecurityStatus ?? "Mesh broadcast channel";
 
     private Peer? _selectedPeer;
     public Peer? SelectedPeer
@@ -112,11 +112,22 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _searchQuery = string.Empty;
 
+    public bool IsSearchActive => !string.IsNullOrWhiteSpace(SearchQuery);
+
+    public string EmptyMessagesTitle => IsSearchActive ? "No matching messages" : "No messages yet";
+
+    public string EmptyMessagesDescription => IsSearchActive
+        ? "No messages match the current search."
+        : "Broadcast messages will appear here. Start another MeshChat client on the same WiFi network or connect to a peer manually.";
+
     partial void OnSearchQueryChanged(string value)
     {
         // CollectionView filtering refreshes the existing virtualized view instead
         // of rebuilding LINQ enumerables during scrolling and auto-scroll checks.
         FilteredMessages.Refresh();
+        OnPropertyChanged(nameof(IsSearchActive));
+        OnPropertyChanged(nameof(EmptyMessagesTitle));
+        OnPropertyChanged(nameof(EmptyMessagesDescription));
     }
 
     // Log filter options
@@ -257,7 +268,7 @@ public partial class MainViewModel : ObservableObject
 
     // ─── UI State ───────────────────────────────────────────────────────────
     [ObservableProperty]
-    private bool _isNetworkLogVisible = true; // Default to visible for debugging
+    private bool _isNetworkLogVisible = true;
 
     [RelayCommand]
     private void ToggleNetworkLog()
@@ -769,8 +780,8 @@ public partial class MainViewModel : ObservableObject
         }
 
         // Final status
-        StatusText = $"Online · Port {_wifi.ListenPort}" +
-                     (IsBluetoothAvailable ? " · Bluetooth ready" : " · No Bluetooth");
+        StatusText = $"Online · WiFi mesh routing · Port {_wifi.ListenPort}" +
+                     (IsBluetoothAvailable ? " · Bluetooth ready" : " · Bluetooth unavailable");
 
         AddLog("══════════════════════════════════════", LogLevel.Info);
         AddLog($"Ready! Your ID: {_wifi.LocalId[..8]}...", LogLevel.Success);
@@ -2233,6 +2244,8 @@ public partial class MainViewModel : ObservableObject
         var entry = new LogEntry
         {
             Timestamp = timestamp,
+            Message = msg,
+            IsSeparator = IsSeparatorLogMessage(msg),
             FullText = $"[{timestamp}] {msg}"
         };
 
@@ -2260,6 +2273,8 @@ public partial class MainViewModel : ObservableObject
         var entry = new LogEntry
         {
             Timestamp = timestamp,
+            Message = msg,
+            IsSeparator = IsSeparatorLogMessage(msg),
             FullText = $"[{timestamp}] {msg}"
         };
 
@@ -2289,6 +2304,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         return entry;
+    }
+
+    private static bool IsSeparatorLogMessage(string msg)
+    {
+        var trimmed = msg.Trim();
+        return trimmed.Length >= 8 && trimmed.All(c => c == '\u2550');
     }
 
     private static Color GetLevelColor(LogLevel level) => level switch

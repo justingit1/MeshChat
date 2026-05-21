@@ -30,6 +30,7 @@ public class LogEntry
     public string Tag { get; set; } = "";
     public Color TagColor { get; set; } = Colors.White;
     public string Message { get; set; } = "";
+    public bool IsSeparator { get; set; }
     public List<LogSegment> Segments { get; set; } = [];
     public string FullText { get; set; } = "";
 }

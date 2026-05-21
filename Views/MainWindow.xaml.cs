@@ -61,7 +61,7 @@ public partial class MainWindow : Window
     private readonly MainViewModel _vm;
     private readonly ILogger<MainWindow> _logger;
     private readonly CancellationTokenSource _windowCts = new();
-    private const double NetworkLogExpandedWidth = 280;
+    private const double NetworkLogExpandedWidth = 248;
     private const double NetworkLogCollapsedWidth = 0;
 
     public MainWindow(ILoggerFactory loggerFactory)
@@ -83,13 +83,8 @@ public partial class MainWindow : Window
         // Auto-scroll the virtualized message list without forcing every item container to be created.
         _vm.Messages.CollectionChanged += Messages_CollectionChanged;
 
-        // Handle network log toggle with animation
-        _vm.OnNetworkLogToggled += AnimateNetworkLog;
-
-        // Also subscribe to property changes to debug
         _vm.PropertyChanged += Vm_PropertyChanged;
 
-        // Set initial state - network log visible for debugging
         Loaded += async (_, _) =>
         {
             // Ensure network log starts visible
@@ -114,7 +109,6 @@ public partial class MainWindow : Window
         Closing += async (_, _) =>
         {
             _vm.Messages.CollectionChanged -= Messages_CollectionChanged;
-            _vm.OnNetworkLogToggled -= AnimateNetworkLog;
             _vm.PropertyChanged -= Vm_PropertyChanged;
 
             _windowCts.Cancel();
@@ -137,7 +131,7 @@ public partial class MainWindow : Window
     {
         if (e.PropertyName == "IsNetworkLogVisible")
         {
-            System.Diagnostics.Debug.WriteLine($"Log visibility changed to: {_vm.IsNetworkLogVisible}");
+            AnimateNetworkLog(_vm.IsNetworkLogVisible);
         }
     }
 
@@ -207,7 +201,16 @@ public partial class MainWindow : Window
             EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
         };
 
+        var panelAnimation = new DoubleAnimation
+        {
+            From = NetworkLogPanel.ActualWidth,
+            To = targetWidth,
+            Duration = TimeSpan.FromMilliseconds(350),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
+        };
+
         NetworkLogColumn.BeginAnimation(ColumnDefinition.WidthProperty, animation);
+        NetworkLogPanel.BeginAnimation(WidthProperty, panelAnimation);
     }
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -247,7 +250,10 @@ public partial class MainWindow : Window
     }
 
     private async void SendButton_Click(object sender, RoutedEventArgs e)
-        => await _vm.SendMessageAsync(_windowCts.Token);
+    {
+        await _vm.SendMessageAsync(_windowCts.Token);
+        FocusMessageComposer();
+    }
 
     private void MessageInput_KeyDown(object sender, KeyEventArgs e)
     {
@@ -257,6 +263,12 @@ public partial class MainWindow : Window
             e.Handled = true;
             _ = _vm.SendMessageAsync(_windowCts.Token);
         }
+    }
+
+    private void FocusMessageComposer()
+    {
+        MessageTextBox.Focus();
+        MessageTextBox.CaretIndex = MessageTextBox.Text.Length;
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -334,20 +346,13 @@ public partial class MainWindow : Window
 
     private void LogToggleButton_Click(object sender, RoutedEventArgs e)
     {
-        // Toggle and animate
-        bool newState = !_vm.IsNetworkLogVisible;
+        bool newState = sender is System.Windows.Controls.Primitives.ToggleButton toggle && toggle.IsChecked == true;
         _vm.IsNetworkLogVisible = newState;
-        AnimateNetworkLog(newState);
     }
 
     private void ClearSearch_Click(object sender, RoutedEventArgs e)
     {
         _vm.SearchQuery = string.Empty;
-    }
-
-    private void EncryptionToggle_Click(object sender, RoutedEventArgs e)
-    {
-        _vm.EncryptionEnabled = !_vm.EncryptionEnabled;
     }
 
     private void CopyMessage_Click(object sender, RoutedEventArgs e)

@@ -211,7 +211,7 @@ public class WiFiService : INetworkService
                         Status = PeerStatus.Online,
                         Transport = MeshChat.Models.TransportType.WiFi,
                         IpAddress = ep.Address,
-                        TcpPort = ListenPort,
+                        TcpPort = packet.TcpPort,
                         HopsAway = 1
                     });
                 }
@@ -234,8 +234,10 @@ public class WiFiService : INetworkService
         {
             if (peerId != null)
             {
-                _connections.TryRemove(peerId, out _);
-                if (IsRunning && !ct.IsCancellationRequested)
+                var removedCurrentConnection =
+                    ((ICollection<KeyValuePair<string, TcpClient>>)_connections)
+                    .Remove(new KeyValuePair<string, TcpClient>(peerId, client));
+                if (removedCurrentConnection && IsRunning && !ct.IsCancellationRequested)
                     PeerLost?.Invoke(peerId);
             }
             client.Dispose();
