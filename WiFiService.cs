@@ -359,9 +359,10 @@ public class WiFiService : INetworkService
 
     public async Task ConnectToPeerAsync(string address, int? port = null, CancellationToken cancellationToken = default)
     {
+        TcpClient? client = null;
         try
         {
-            var client = new TcpClient();
+            client = new TcpClient();
             var tcpPort = port ?? DefaultPort;
             await client.ConnectAsync(address, tcpPort, cancellationToken);
             Log("Connected to {Address}:{Port}", address, tcpPort);
@@ -376,8 +377,13 @@ public class WiFiService : INetworkService
                 TcpPort = ListenPort
             };
             await SendPacketToClientAsync(client, hello, cancellationToken);
+            client = null;
         }
         catch (Exception ex) { LogWarning(ex, "Connect failed: {Message}", ex.Message); }
+        finally
+        {
+            client?.Dispose();
+        }
     }
 
     private void Log(string message, params object?[] args)

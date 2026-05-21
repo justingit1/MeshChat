@@ -15,6 +15,7 @@ public sealed class PeerTrustStore
     private readonly object _lock = new();
     private readonly ILogger<PeerTrustStore> _logger;
     private readonly Dictionary<string, TrustedPeer> _peers = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _peerIdByFingerprint = new(StringComparer.OrdinalIgnoreCase);
 
     public PeerTrustStore(ILogger<PeerTrustStore>? logger = null)
         : this(CreateDefaultFilePath(), logger)
@@ -43,6 +44,7 @@ public sealed class PeerTrustStore
         lock (_lock)
         {
             _peers.Clear();
+            _peerIdByFingerprint.Clear();
 
             try
             {
@@ -53,7 +55,7 @@ public sealed class PeerTrustStore
                 var peers = JsonConvert.DeserializeObject<List<TrustedPeer>>(json) ?? [];
 
                 foreach (var peer in peers.Where(p => !string.IsNullOrWhiteSpace(p.PeerId)))
-                    _peers[peer.PeerId] = NormalizePeer(peer);
+                    StorePeer(NormalizePeer(peer));
             }
             catch (Exception ex)
             {
@@ -114,7 +116,7 @@ public sealed class PeerTrustStore
                     LastSeen = now
                 };
 
-                _peers[peerId] = created;
+                StorePeer(created);
                 return created;
             }
 
@@ -135,7 +137,7 @@ public sealed class PeerTrustStore
                 VerifiedAt = nextState == TrustState.Verified ? existing.VerifiedAt : null
             };
 
-            _peers[peerId] = updated;
+            StorePeer(updated, existing.Fingerprint);
             return updated;
         }
     }
@@ -158,7 +160,7 @@ public sealed class PeerTrustStore
                     VerifiedAt = null
                 };
 
-                _peers[peerId] = updated;
+                StorePeer(updated, existing.Fingerprint);
                 return updated;
             }
 
@@ -172,7 +174,7 @@ public sealed class PeerTrustStore
                 LastSeen = now
             };
 
-            _peers[peerId] = created;
+            StorePeer(created);
             return created;
         }
     }
@@ -194,8 +196,10 @@ public sealed class PeerTrustStore
 
         lock (_lock)
         {
-            return _peers.Values.FirstOrDefault(p =>
-                p.Fingerprint.Equals(normalizedFingerprint, StringComparison.OrdinalIgnoreCase));
+            return _peerIdByFingerprint.TryGetValue(normalizedFingerprint, out var peerId) &&
+                   _peers.TryGetValue(peerId, out var peer)
+                ? peer
+                : null;
         }
     }
 
@@ -212,9 +216,35 @@ public sealed class PeerTrustStore
                 VerifiedAt = trustState == TrustState.Verified ? verifiedAt : null
             };
 
-            _peers[peerId] = updated;
+            StorePeer(updated, existing.Fingerprint);
             return updated;
         }
+    }
+
+    private void StorePeer(TrustedPeer peer, string? previousFingerprint = null)
+    {
+        if (!string.IsNullOrWhiteSpace(previousFingerprint) &&
+            !previousFingerprint.Equals(peer.Fingerprint, StringComparison.OrdinalIgnoreCase))
+        {
+            var normalizedPreviousFingerprint = NormalizeFingerprint(previousFingerprint);
+            if (_peerIdByFingerprint.TryGetValue(normalizedPreviousFingerprint, out var mappedPeerId) &&
+                mappedPeerId == peer.PeerId)
+            {
+                _peerIdByFingerprint.Remove(normalizedPreviousFingerprint);
+
+                var replacement = _peers.Values.FirstOrDefault(existing =>
+                    existing.PeerId != peer.PeerId &&
+                    existing.Fingerprint.Equals(normalizedPreviousFingerprint, StringComparison.OrdinalIgnoreCase));
+
+                if (replacement != null)
+                    _peerIdByFingerprint[normalizedPreviousFingerprint] = replacement.PeerId;
+            }
+        }
+
+        _peers[peer.PeerId] = peer;
+
+        if (!string.IsNullOrWhiteSpace(peer.Fingerprint))
+            _peerIdByFingerprint[peer.Fingerprint] = peer.PeerId;
     }
 
     private static TrustedPeer NormalizePeer(TrustedPeer peer)

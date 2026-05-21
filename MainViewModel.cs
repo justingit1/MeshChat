@@ -284,10 +284,13 @@ public partial class MainViewModel : ObservableObject
     private readonly Dictionary<string, List<ChatMessage>> _messageHistory = [];
     private readonly Dictionary<string, Peer> _peerById = [];
     private readonly Dictionary<string, ChatMessage> _messageById = [];
+    private readonly Dictionary<string, (string ConversationId, int Index)> _messageLocationById = [];
+    private readonly Dictionary<string, int> _visibleMessageIndexById = [];
     private readonly Dictionary<string, Dictionary<string, HashSet<string>>> _reactionUsersByMessage = [];
     private readonly Dictionary<string, CancellationTokenSource> _ackRetryCancellations = [];
     private readonly HashSet<string> _keyExchangeInFlight = [];
     private readonly HashSet<string> _queuedSendInFlight = [];
+    private readonly HashSet<string> _queuedOutgoingTextMessageIds = [];
     private readonly object _ackRetryLock = new();
     private readonly object _queuedSendLock = new();
     private readonly SemaphoreSlim _saveLock = new(1, 1);
@@ -483,13 +486,8 @@ public partial class MainViewModel : ObservableObject
 
     private void TryResendQueuedTextMessages()
     {
-        var queuedMessages = _messageHistory.Values
-            .SelectMany(history => history)
-            .Where(IsQueuedOutgoingTextMessage)
-            .ToList();
-
-        foreach (var msg in queuedMessages)
-            _ = TryResendQueuedTextMessageAsync(msg.Id, _lifetimeCts.Token);
+        foreach (var messageId in _queuedOutgoingTextMessageIds.ToArray())
+            _ = TryResendQueuedTextMessageAsync(messageId, _lifetimeCts.Token);
     }
 
     private async Task TryResendQueuedTextMessageAsync(string messageId, CancellationToken cancellationToken)
@@ -508,10 +506,14 @@ public partial class MainViewModel : ObservableObject
             bool isEncrypted;
 
             if (!_messageById.TryGetValue(messageId, out msg!) || !IsQueuedOutgoingTextMessage(msg))
+            {
+                _queuedOutgoingTextMessageIds.Remove(messageId);
                 return;
+            }
 
             if (msg.QueueRetryCount >= MaxQueuedSendAttempts)
             {
+                _queuedOutgoingTextMessageIds.Remove(messageId);
                 AddLog($"[QUEUED] Retry limit reached for message {messageId}", LogLevel.Warning);
                 return;
             }
@@ -636,10 +638,9 @@ public partial class MainViewModel : ObservableObject
     {
         lock (_ackRetryLock)
         {
-            if (_ackRetryCancellations.TryGetValue(messageId, out var cts) &&
-                cts.IsCancellationRequested)
+            if (_ackRetryCancellations.Remove(messageId, out var cts))
             {
-                _ackRetryCancellations.Remove(messageId);
+                cts.Dispose();
             }
         }
     }
@@ -876,7 +877,7 @@ public partial class MainViewModel : ObservableObject
 
         // Add to local history and always show in current view
         msg = AddMessageToHistory(selectedPeer.Id, msg);
-        Messages.Add(msg);
+        AddVisibleMessage(msg);
 
         var jsonPayload = JsonConvert.SerializeObject(msg);
 
@@ -942,7 +943,7 @@ public partial class MainViewModel : ObservableObject
         };
 
         msg = AddMessageToHistory(SelectedPeer.Id, msg);
-        Messages.Add(msg);
+        AddVisibleMessage(msg);
 
         await foreach (var packet in _fileTransfer.ChunkFileAsync(
             filePath, SelectedPeer.Id, _wifi.LocalId, DisplayName, cancellationToken, msg.Id))
@@ -1035,7 +1036,7 @@ public partial class MainViewModel : ObservableObject
             sysMsg = AddMessageToHistory(peerId, sysMsg);
 
             if (SelectedPeer?.Id == peerId)
-                Messages.Add(sysMsg);
+                AddVisibleMessage(sysMsg);
         }
     }
 
@@ -1578,7 +1579,7 @@ public partial class MainViewModel : ObservableObject
 
         if (isViewingThisPeer || isInBroadcastView)
         {
-            Messages.Add(msg);
+            AddVisibleMessage(msg);
 
             if (isViewingThisPeer)
             {
@@ -1747,7 +1748,7 @@ public partial class MainViewModel : ObservableObject
             var isInBroadcastView = SelectedPeer == null;
             if (isViewingThisPeer || isInBroadcastView)
             {
-                Messages.Add(msg);
+                AddVisibleMessage(msg);
             }
             else if (!isBroadcast && _peerById.TryGetValue(info.SenderId, out var peer))
             {
@@ -1792,7 +1793,7 @@ public partial class MainViewModel : ObservableObject
         if (!_messageHistory.TryGetValue(conversationId, out var history))
             _messageHistory[conversationId] = history = [];
         history.Add(msg);
-        IndexMessage(msg);
+        IndexMessage(conversationId, history.Count - 1, msg);
         _ = SaveMessagesAsync(_lifetimeCts.Token);
         return msg;
     }
@@ -1827,23 +1828,56 @@ public partial class MainViewModel : ObservableObject
 
     private ChatMessage ReplaceMessage(ChatMessage current, ChatMessage updated)
     {
-        foreach (var history in _messageHistory.Values)
+        if (_messageLocationById.TryGetValue(current.Id, out var location) &&
+            _messageHistory.TryGetValue(location.ConversationId, out var indexedHistory) &&
+            location.Index >= 0 &&
+            location.Index < indexedHistory.Count &&
+            indexedHistory[location.Index].Id == current.Id)
         {
-            for (var i = 0; i < history.Count; i++)
+            indexedHistory[location.Index] = updated;
+            _messageLocationById[updated.Id] = location;
+        }
+        else
+        {
+            foreach (var historyEntry in _messageHistory)
             {
-                if (history[i].Id == current.Id)
-                    history[i] = updated;
+                var history = historyEntry.Value;
+                for (var i = 0; i < history.Count; i++)
+                {
+                    if (history[i].Id == current.Id)
+                    {
+                        history[i] = updated;
+                        _messageLocationById[updated.Id] = (historyEntry.Key, i);
+                        break;
+                    }
+                }
             }
         }
 
-        for (var i = 0; i < Messages.Count; i++)
+        if (_visibleMessageIndexById.TryGetValue(current.Id, out var visibleIndex) &&
+            visibleIndex >= 0 &&
+            visibleIndex < Messages.Count &&
+            Messages[visibleIndex].Id == current.Id)
         {
-            if (Messages[i].Id == current.Id)
-                Messages[i] = updated;
+            Messages[visibleIndex] = updated;
+            _visibleMessageIndexById[updated.Id] = visibleIndex;
+        }
+        else
+        {
+            for (var i = 0; i < Messages.Count; i++)
+            {
+                if (Messages[i].Id == current.Id)
+                {
+                    Messages[i] = updated;
+                    _visibleMessageIndexById[updated.Id] = i;
+                    break;
+                }
+            }
         }
 
         _messageById[updated.Id] = updated;
         IndexReactions(updated);
+        TrackQueueState(updated);
         if (updated.Status is MessageStatus.Delivered or MessageStatus.Read or MessageStatus.Failed)
             CancelAckRetry(updated.Id);
         _ = SaveMessagesAsync(_lifetimeCts.Token);
@@ -1851,13 +1885,25 @@ public partial class MainViewModel : ObservableObject
     }
 
     private ChatMessage MarkMessageStatusAtLeast(ChatMessage msg, MessageStatus status)
-        => GetMessageStatusRank(msg.Status) >= GetMessageStatusRank(status)
+    {
+        if (msg.Status == MessageStatus.Failed &&
+            status is MessageStatus.Delivered or MessageStatus.Read)
+        {
+            return ReplaceMessage(msg, msg with
+            {
+                Status = status,
+                QueuedAt = null
+            });
+        }
+
+        return GetMessageStatusRank(msg.Status) >= GetMessageStatusRank(status)
             ? msg
             : ReplaceMessage(msg, msg with
             {
                 Status = status,
                 QueuedAt = status is MessageStatus.Delivered or MessageStatus.Read ? null : msg.QueuedAt
             });
+    }
 
     private static int GetMessageStatusRank(MessageStatus status) => status switch
     {
@@ -1882,6 +1928,7 @@ public partial class MainViewModel : ObservableObject
 
     private Peer ReplacePeer(Peer current, Peer updated)
     {
+        TotalUnreadCount += updated.UnreadCount - current.UnreadCount;
         _peerById[updated.Id] = updated;
 
         for (var i = 0; i < Peers.Count; i++)
@@ -1912,7 +1959,7 @@ public partial class MainViewModel : ObservableObject
                 if (!_messageHistory.TryGetValue(conversationId, out var history))
                     _messageHistory[conversationId] = history = [];
                 history.Add(persistedMessage);
-                IndexMessage(persistedMessage);
+                IndexMessage(conversationId, history.Count - 1, persistedMessage);
             }
             _logger.LogInformation("Loaded {MessageCount} persisted messages", messages.Count);
         }
@@ -1988,13 +2035,26 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private void IndexMessage(ChatMessage msg)
+    private void IndexMessage(string conversationId, int index, ChatMessage msg)
     {
         if (!string.IsNullOrWhiteSpace(msg.Id))
         {
             _messageById[msg.Id] = msg;
+            _messageLocationById[msg.Id] = (conversationId, index);
             IndexReactions(msg);
+            TrackQueueState(msg);
         }
+    }
+
+    private void TrackQueueState(ChatMessage msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg.Id))
+            return;
+
+        if (IsQueuedOutgoingTextMessage(msg))
+            _queuedOutgoingTextMessageIds.Add(msg.Id);
+        else
+            _queuedOutgoingTextMessageIds.Remove(msg.Id);
     }
 
     private void IndexReactions(ChatMessage msg)
@@ -2090,7 +2150,32 @@ public partial class MainViewModel : ObservableObject
     {
         // Build the visible window off-collection, then publish it as one Reset.
         // This avoids hundreds of per-item collection events when changing peers.
-        Messages.ReplaceAll(BuildMessagesWithDateSeparators(history));
+        var visibleMessages = BuildMessagesWithDateSeparators(history);
+        Messages.ReplaceAll(visibleMessages);
+        RebuildVisibleMessageIndex(visibleMessages);
+    }
+
+    private void AddVisibleMessage(ChatMessage msg)
+    {
+        Messages.Add(msg);
+        IndexVisibleMessage(msg, Messages.Count - 1);
+    }
+
+    private void IndexVisibleMessage(ChatMessage msg, int index)
+    {
+        if (!string.IsNullOrWhiteSpace(msg.Id) && !msg.IsDateSeparator)
+            _visibleMessageIndexById[msg.Id] = index;
+    }
+
+    private void RebuildVisibleMessageIndex(IEnumerable<ChatMessage> visibleMessages)
+    {
+        _visibleMessageIndexById.Clear();
+        var index = 0;
+        foreach (var msg in visibleMessages)
+        {
+            IndexVisibleMessage(msg, index);
+            index++;
+        }
     }
 
     private static List<ChatMessage> BuildMessagesWithDateSeparators(List<ChatMessage> history)
@@ -2141,7 +2226,7 @@ public partial class MainViewModel : ObservableObject
 
     private void UpdateUnreadCounts()
     {
-        TotalUnreadCount = Peers.Sum(p => p.UnreadCount);
+        OnPropertyChanged(nameof(TotalUnreadCount));
     }
 
     // ─── Typing Indicator Helpers ───────────────────────────────────────────

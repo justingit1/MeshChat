@@ -143,6 +143,31 @@ public sealed class PeerTrustStoreTests
         Assert.Equal("peer-1", peer.PeerId);
     }
 
+    [Fact]
+    public void GetByFingerprint_DoesNotReturnOldFingerprintAfterIdentityChange()
+    {
+        var store = new PeerTrustStore(CreateTempFilePath());
+        store.UpsertPeerIdentity("peer-1", "Alice", [1, 2, 3], "abcdef");
+
+        store.UpsertPeerIdentity("peer-1", "Alice", [4, 5, 6], "123456");
+
+        Assert.Null(store.GetByFingerprint("abcdef"));
+        Assert.Equal("peer-1", store.GetByFingerprint("123456")?.PeerId);
+    }
+
+    [Fact]
+    public void GetByFingerprint_ReturnsRemainingPeerAfterDuplicateFingerprintIdentityChange()
+    {
+        var store = new PeerTrustStore(CreateTempFilePath());
+        store.UpsertPeerIdentity("peer-1", "Alice", [1, 2, 3], "abcdef");
+        store.UpsertPeerIdentity("peer-2", "Bob", [1, 2, 3], "abcdef");
+
+        store.UpsertPeerIdentity("peer-1", "Alice", [4, 5, 6], "123456");
+
+        Assert.Equal("peer-2", store.GetByFingerprint("abcdef")?.PeerId);
+        Assert.Equal("peer-1", store.GetByFingerprint("123456")?.PeerId);
+    }
+
     private static string CreateTempFilePath()
     {
         var directory = Path.Combine(Path.GetTempPath(), "MeshChat.Tests", Guid.NewGuid().ToString("N"));

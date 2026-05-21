@@ -549,6 +549,35 @@ public sealed class MessageStatusTests
         Assert.Equal(MessageStatus.Read, Assert.Single(vm.Messages).Status);
     }
 
+    [Theory]
+    [InlineData("HandleDeliveryAck", MessageStatus.Delivered)]
+    [InlineData("HandleReadReceipt", MessageStatus.Read)]
+    public void Receipts_AdvanceFailedQueuedMessage(string receiptHandler, MessageStatus expectedStatus)
+    {
+        var wifi = new FakeNetworkService { LocalId = "local" };
+        var bluetooth = new FakeNetworkService { LocalId = "local" };
+        var vm = CreateViewModel(wifi, bluetooth);
+        var message = new ChatMessage
+        {
+            Id = "message-1",
+            SenderId = "local",
+            SenderName = "Local",
+            Content = "hello",
+            Status = MessageStatus.Failed,
+            ConversationId = "peer",
+            TargetPeerId = "peer",
+            QueuedAt = DateTime.UtcNow
+        };
+        AddMessageToHistory(vm, "peer", message);
+        vm.Messages.Add(message);
+
+        InvokeReceiptHandler(vm, receiptHandler, message.Id);
+
+        var updated = Assert.Single(vm.Messages);
+        Assert.Equal(expectedStatus, updated.Status);
+        Assert.Null(updated.QueuedAt);
+    }
+
     [Fact]
     public async Task HandleIncomingMessageAsync_FirstReceive_AddsVisibleAndHistoryMessage()
     {
@@ -654,10 +683,13 @@ public sealed class MessageStatusTests
         SetField(vm, "_messageHistory", new Dictionary<string, List<ChatMessage>>());
         SetField(vm, "_peerById", peers.ToDictionary(peer => peer.Id));
         SetField(vm, "_messageById", new Dictionary<string, ChatMessage>());
+        SetField(vm, "_messageLocationById", new Dictionary<string, (string ConversationId, int Index)>());
+        SetField(vm, "_visibleMessageIndexById", new Dictionary<string, int>());
         SetField(vm, "_reactionUsersByMessage", new Dictionary<string, Dictionary<string, HashSet<string>>>());
         SetField(vm, "_ackRetryCancellations", new Dictionary<string, CancellationTokenSource>());
         SetField(vm, "_keyExchangeInFlight", new HashSet<string>());
         SetField(vm, "_queuedSendInFlight", new HashSet<string>());
+        SetField(vm, "_queuedOutgoingTextMessageIds", new HashSet<string>());
         SetField(vm, "_ackRetryLock", new object());
         SetField(vm, "_queuedSendLock", new object());
         SetField(vm, "_saveLock", new SemaphoreSlim(1, 1));
