@@ -10,6 +10,9 @@ public enum PacketType
     MessageAck,     // delivery receipt
     ReadReceipt,    // read receipt
     FileChunk,      // file transfer chunk
+    FileOffer,      // file transfer authorization offer
+    FileAccept,     // file transfer authorization accept
+    FileDecline,    // file transfer authorization decline
     FileComplete,   // file transfer done
     PeerList,       // share known peers (mesh relay info)
     Goodbye,        // peer is leaving

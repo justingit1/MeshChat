@@ -942,17 +942,31 @@ public partial class MainViewModel : ObservableObject
             Transport = SelectedPeer.Transport == TransportType.Bluetooth ? "Bluetooth" : "WiFi"
         };
 
-        msg = AddMessageToHistory(SelectedPeer.Id, msg);
-        AddVisibleMessage(msg);
+        InvokeOnUiThread(() =>
+        {
+            msg = AddMessageToHistory(SelectedPeer.Id, msg);
+            AddVisibleMessage(msg);
+        });
 
         await foreach (var packet in _fileTransfer.ChunkFileAsync(
             filePath, SelectedPeer.Id, _wifi.LocalId, DisplayName, cancellationToken, msg.Id))
         {
+            if (!TryApplySessionPacketEncryption(SelectedPeer.Id, packet))
+            {
+                InvokeOnUiThread(() => msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Failed }));
+                ShowToast($"Encrypted session unavailable for {SelectedPeer.DisplayName}", true);
+                AddLog($"[FileTransfer] File transfer to {SelectedPeer.DisplayName} requires an encrypted session", LogLevel.Warning);
+                return;
+            }
+
             await SendToPeerViaTransportAsync(SelectedPeer.Id, packet, cancellationToken);
         }
 
-        msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
-        OnPropertyChanged(nameof(Messages));
+        InvokeOnUiThread(() =>
+        {
+            msg = ReplaceMessage(msg, msg with { Status = MessageStatus.Sent });
+            OnPropertyChanged(nameof(Messages));
+        });
     }
 
     // ─── Event Handlers ─────────────────────────────────────────────────────
@@ -1065,7 +1079,8 @@ public partial class MainViewModel : ObservableObject
                     break;
 
                 case PacketType.FileChunk:
-                    _fileTransfer.HandleChunk(packet);
+                    if (TryPrepareIncomingFileChunkPacket(packet, out var fileChunkPacket))
+                        _fileTransfer.HandleChunk(fileChunkPacket);
                     break;
 
                 case PacketType.FileComplete:
@@ -1284,6 +1299,22 @@ public partial class MainViewModel : ObservableObject
         }
 
         var fingerprint = CryptoEncoding.ToHex(SHA256.HashData(payload.IdentityPublicKey));
+        var existingPeer = _peerTrustStore.GetByPeerId(payload.SenderPeerId);
+        if (existingPeer != null &&
+            existingPeer.IdentityPublicKey.Length > 0 &&
+            (!existingPeer.Fingerprint.Equals(fingerprint, StringComparison.OrdinalIgnoreCase) ||
+             !existingPeer.IdentityPublicKey.SequenceEqual(payload.IdentityPublicKey)))
+        {
+            AddLog($"[KeyExchange] Rejected identity change from {peerName}; re-verification is required", LogLevel.Warning);
+            return false;
+        }
+
+        if (!TryVerifyKeyExchangeSignature(packet.Type, payload))
+        {
+            AddLog($"[KeyExchange] Rejected packet from {peerName}: signature verification failed", LogLevel.Warning);
+            return false;
+        }
+
         _peerTrustStore.UpsertPeerIdentity(
             payload.SenderPeerId,
             peerName,
@@ -1292,6 +1323,23 @@ public partial class MainViewModel : ObservableObject
         _peerTrustStore.Save();
         RefreshPeerSecurityStatus(payload.SenderPeerId);
         return true;
+    }
+
+    private static bool TryVerifyKeyExchangeSignature(PacketType packetType, KeyExchangePayload payload)
+    {
+        try
+        {
+            using var publicKey = ECDsa.Create();
+            publicKey.ImportSubjectPublicKeyInfo(payload.IdentityPublicKey, out _);
+            return publicKey.VerifyData(
+                KeyExchangeTranscript.GetBytes(packetType, payload),
+                payload.Signature,
+                HashAlgorithmName.SHA256);
+        }
+        catch (Exception ex) when (ex is ArgumentException or CryptographicException)
+        {
+            return false;
+        }
     }
 
     private bool TryDeserializeKeyExchangePayload<TPayload>(NetworkPacket packet, out TPayload payload)
@@ -1509,9 +1557,8 @@ public partial class MainViewModel : ObservableObject
         var payload = packet.Payload;
         if (packet.IsEncrypted)
         {
-            var decrypted = packet.CryptoVersion == CryptoVersionEcdhAesGcm2
-                ? TryDecryptSessionMessage(packet, out payload)
-                : TryDecrypt(payload, packet.CryptoVersion, out payload);
+            var decrypted = packet.CryptoVersion == CryptoVersionEcdhAesGcm2 &&
+                TryDecryptSessionPacket(packet, out payload);
 
             if (!decrypted)
             {
@@ -2417,21 +2464,12 @@ public partial class MainViewModel : ObservableObject
     }
 
     // ─── Message Encryption (AES-GCM with shared key) ────────────────────────
-    private const string CryptoVersionAesGcm1 = "AESGCM1";
     private const string CryptoVersionEcdhAesGcm2 = SessionKeyManager.CryptoVersion;
-    private const string EncryptionKey = "MeshChatSecretKey2024!";
 
     private void ApplyDirectMessageEncryption(string peerId, NetworkPacket packet, bool useLegacyEncryption)
     {
-        if (TryApplySessionMessageEncryption(peerId, packet))
-            return;
-
-        if (!useLegacyEncryption || !EncryptionEnabled || string.IsNullOrEmpty(packet.Payload))
-            return;
-
-        packet.Payload = Encrypt(packet.Payload);
-        packet.IsEncrypted = true;
-        packet.CryptoVersion = CryptoVersionAesGcm1;
+        _ = useLegacyEncryption;
+        TryApplySessionPacketEncryption(peerId, packet);
     }
 
     private bool IsVerifiedDirectTextWithoutEncryption(string peerId, NetworkPacket packet)
@@ -2444,12 +2482,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         EnsurePeerTrustStoreLoaded();
-        return _peerTrustStore.GetByPeerId(peerId)?.TrustState == TrustState.Verified;
+        return EncryptionEnabled || _peerTrustStore.GetByPeerId(peerId)?.TrustState == TrustState.Verified;
     }
 
-    private bool TryApplySessionMessageEncryption(string peerId, NetworkPacket packet)
+    private bool TryApplySessionPacketEncryption(string peerId, NetworkPacket packet)
     {
-        if (packet.Type != PacketType.Message ||
+        if (packet.Type is not (PacketType.Message or PacketType.FileChunk) ||
             string.IsNullOrWhiteSpace(packet.Payload) ||
             string.IsNullOrWhiteSpace(packet.TargetId) ||
             !_peerById.TryGetValue(peerId, out var peer) ||
@@ -2470,7 +2508,8 @@ public partial class MainViewModel : ObservableObject
         }
 
         var plainBytes = System.Text.Encoding.UTF8.GetBytes(packet.Payload);
-        var associatedData = CreateSessionMessageAssociatedData(
+        var associatedData = CreateSessionPacketAssociatedData(
+            packet.Type,
             packet.SenderId,
             packet.TargetId,
             session.SessionId,
@@ -2487,7 +2526,53 @@ public partial class MainViewModel : ObservableObject
         return true;
     }
 
-    private bool TryDecryptSessionMessage(NetworkPacket packet, out string plainText)
+    private bool TryPrepareIncomingFileChunkPacket(NetworkPacket packet, out NetworkPacket preparedPacket)
+    {
+        preparedPacket = packet;
+
+        if (string.IsNullOrWhiteSpace(packet.TargetId) ||
+            !packet.TargetId.Equals(_wifi.LocalId, StringComparison.Ordinal))
+        {
+            AddLog($"[FileTransfer] Rejected non-direct file chunk from {packet.SenderName ?? packet.SenderId}", LogLevel.Warning);
+            return false;
+        }
+
+        if (IsPeerBlocked(packet.SenderId))
+            return false;
+
+        EnsurePeerTrustStoreLoaded();
+        if (_peerTrustStore.GetByPeerId(packet.SenderId)?.TrustState != TrustState.Verified)
+        {
+            AddLog($"[FileTransfer] Rejected unverified file chunk from {packet.SenderName ?? packet.SenderId}", LogLevel.Warning);
+            return false;
+        }
+
+        if (!packet.IsEncrypted ||
+            packet.CryptoVersion != CryptoVersionEcdhAesGcm2 ||
+            !TryDecryptSessionPacket(packet, out var payload))
+        {
+            AddLog($"[FileTransfer] Rejected unauthenticated file chunk from {packet.SenderName ?? packet.SenderId}", LogLevel.Warning);
+            return false;
+        }
+
+        preparedPacket = new NetworkPacket
+        {
+            Id = packet.Id,
+            Type = packet.Type,
+            SenderId = packet.SenderId,
+            SenderName = packet.SenderName,
+            TargetId = packet.TargetId,
+            Ttl = packet.Ttl,
+            VisitedNodes = packet.VisitedNodes,
+            CreatedAt = packet.CreatedAt,
+            Payload = payload,
+            TcpPort = packet.TcpPort,
+            KnownPeers = packet.KnownPeers
+        };
+        return true;
+    }
+
+    private bool TryDecryptSessionPacket(NetworkPacket packet, out string plainText)
     {
         plainText = string.Empty;
 
@@ -2512,7 +2597,8 @@ public partial class MainViewModel : ObservableObject
         try
         {
             var counter = packet.CryptoMessageCounter.Value;
-            var associatedData = CreateSessionMessageAssociatedData(
+            var associatedData = CreateSessionPacketAssociatedData(
+                packet.Type,
                 packet.SenderId,
                 packet.TargetId,
                 packet.CryptoSessionId,
@@ -2529,7 +2615,7 @@ public partial class MainViewModel : ObservableObject
                     out var lastSeenCounter))
             {
                 AddLog(
-                    $"Dropped ECDH_AESGCM2 replay/old-counter message from {packet.SenderName ?? packet.SenderId}: counter {counter}, last accepted {lastSeenCounter}",
+                    $"Dropped ECDH_AESGCM2 replay/old-counter packet from {packet.SenderName ?? packet.SenderId}: counter {counter}, last accepted {lastSeenCounter}",
                     LogLevel.Warning);
                 return false;
             }
@@ -2551,7 +2637,8 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private static byte[] CreateSessionMessageAssociatedData(
+    private static byte[] CreateSessionPacketAssociatedData(
+        PacketType packetType,
         string senderId,
         string? targetId,
         string sessionId,
@@ -2559,90 +2646,19 @@ public partial class MainViewModel : ObservableObject
         => System.Text.Encoding.UTF8.GetBytes(string.Join('\n',
         [
             CryptoVersionEcdhAesGcm2,
-            PacketType.Message.ToString(),
+            packetType.ToString(),
             sessionId,
             senderId,
             targetId ?? string.Empty,
             counter.ToString(System.Globalization.CultureInfo.InvariantCulture)
         ]));
 
-    private string Encrypt(string plainText)
-    {
-        if (string.IsNullOrEmpty(plainText) || !EncryptionEnabled) return plainText;
-
-        // AES-GCM provides authenticated encryption, so tampered ciphertext fails
-        // during decryption instead of producing corrupted JSON.
-        const int nonceSize = 12; // 96-bit nonce is the standard size for GCM.
-        const int tagSize = 16;   // 128-bit authentication tag.
-
-        // Hash the shared passphrase into a fixed 256-bit key expected by AES.
-        // This preserves the existing shared-key model; a real deployment should
-        // exchange or derive this key per peer instead of hard-coding it.
-        var keyBytes = System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(EncryptionKey));
-        var nonce = new byte[nonceSize];
-        System.Security.Cryptography.RandomNumberGenerator.Fill(nonce);
-
-        var plainBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
-        var cipherBytes = new byte[plainBytes.Length];
-        var tag = new byte[tagSize];
-
-        using var aes = new System.Security.Cryptography.AesGcm(keyBytes, tagSize);
-        aes.Encrypt(nonce, plainBytes, cipherBytes, tag);
-
-        // Keep packet serialization unchanged by storing binary crypto fields as
-        // a single Base64 payload string: nonce | tag | ciphertext.
-        var encryptedBytes = new byte[nonce.Length + tag.Length + cipherBytes.Length];
-        Buffer.BlockCopy(nonce, 0, encryptedBytes, 0, nonce.Length);
-        Buffer.BlockCopy(tag, 0, encryptedBytes, nonce.Length, tag.Length);
-        Buffer.BlockCopy(cipherBytes, 0, encryptedBytes, nonce.Length + tag.Length, cipherBytes.Length);
-
-        return CryptoVersionAesGcm1 + ":" + Convert.ToBase64String(encryptedBytes);
-    }
-
     private bool TryDecrypt(string encryptedText, string? cryptoVersion, out string plainText)
     {
         plainText = encryptedText;
-        if (string.IsNullOrEmpty(encryptedText)) return false;
-        if (cryptoVersion != CryptoVersionAesGcm1) return false;
-
-        try
-        {
-            const string prefix = CryptoVersionAesGcm1 + ":";
-            const int nonceSize = 12;
-            const int tagSize = 16;
-
-            if (!encryptedText.StartsWith(prefix, StringComparison.Ordinal))
-                return false;
-
-            var encryptedBytes = Convert.FromBase64String(encryptedText[prefix.Length..]);
-            if (encryptedBytes.Length < nonceSize + tagSize)
-                return false;
-
-            var nonce = encryptedBytes[..nonceSize];
-            var tag = encryptedBytes[nonceSize..(nonceSize + tagSize)];
-            var cipherBytes = encryptedBytes[(nonceSize + tagSize)..];
-            var plainBytes = new byte[cipherBytes.Length];
-
-            // Derive the same 256-bit AES key from the shared passphrase used by
-            // Encrypt; the random nonce is stored with each packet, not secret.
-            var keyBytes = System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(EncryptionKey));
-
-            using var aes = new System.Security.Cryptography.AesGcm(keyBytes, tagSize);
-            aes.Decrypt(nonce, cipherBytes, tag, plainBytes);
-
-            plainText = System.Text.Encoding.UTF8.GetString(plainBytes);
-            return true;
-        }
-        catch (FormatException)
-        {
-            return false;
-        }
-        catch (System.Security.Cryptography.CryptographicException)
-        {
-            return false;
-        }
+        _ = encryptedText;
+        _ = cryptoVersion;
+        return false;
     }
 
 }

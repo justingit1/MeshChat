@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.Serialization;
+using System.Text;
 using MeshChat.Models;
 using MeshChat.Services;
 using MeshChat.ViewModels;
@@ -84,5 +85,52 @@ public sealed class NetworkPacketBehaviorTests
         Assert.Equal(4, original.Ttl);
         Assert.Equal(["origin-node"], original.VisitedNodes);
         Assert.Same(originalVisited, original.VisitedNodes);
+    }
+
+    [Theory]
+    [InlineData(typeof(WiFiService))]
+    [InlineData(typeof(BluetoothService))]
+    public async Task ReadLineWithLimitAsync_RejectsInputWithoutNewlineOverLimit(Type serviceType)
+    {
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            InvokeReadLineWithLimitAsync(serviceType, new string('x', 9), maxChars: 8));
+    }
+
+    [Theory]
+    [InlineData(typeof(WiFiService))]
+    [InlineData(typeof(BluetoothService))]
+    public async Task ReadLineWithLimitAsync_RejectsOversizedJsonEnvelopeBeforeParse(Type serviceType)
+    {
+        var oversizedJson = "{\"Type\":2,\"Payload\":\"" + new string('a', 1024);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            InvokeReadLineWithLimitAsync(serviceType, oversizedJson, maxChars: 128));
+    }
+
+    [Theory]
+    [InlineData(typeof(WiFiService))]
+    [InlineData(typeof(BluetoothService))]
+    public async Task ReadLineWithLimitAsync_RejectsMalformedOversizedPacketBeforeParse(Type serviceType)
+    {
+        var malformedOversizedPacket = "{\"Type\":2,\"TargetId\":\"direct\",\"Payload\":\"" + new string('[', 1024);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            InvokeReadLineWithLimitAsync(serviceType, malformedOversizedPacket, maxChars: 128));
+    }
+
+    private static async Task<string?> InvokeReadLineWithLimitAsync(
+        Type serviceType,
+        string input,
+        int maxChars)
+    {
+        var method = serviceType.GetMethod(
+            "ReadLineWithLimitAsync",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(input));
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        var task = (Task<string?>)method.Invoke(null, [reader, maxChars, CancellationToken.None])!;
+        return await task;
     }
 }

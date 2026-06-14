@@ -19,6 +19,7 @@ namespace MeshChat.Services;
 public class BluetoothService : INetworkService
 {
     private const int MaxPacketIdCacheSize = 10000; // Prevent unbounded growth
+    private const int MaxPacketBytes = 1024 * 1024;
     private const string TransportName = "Bluetooth";
     private readonly ILogger<BluetoothService> _logger;
     private BluetoothListener? _listener;
@@ -160,7 +161,7 @@ public class BluetoothService : INetworkService
 
             while (!ct.IsCancellationRequested && client.Connected)
             {
-                var line = await reader.ReadLineAsync(ct);
+                var line = await ReadLineWithLimitAsync(reader, MaxPacketBytes, ct);
                 if (line == null) break;
 
                 var packet = JsonConvert.DeserializeObject<NetworkPacket>(line);
@@ -520,6 +521,31 @@ public class BluetoothService : INetworkService
         }
 
         return result.ToString();
+    }
+
+    private static async Task<string?> ReadLineWithLimitAsync(
+        StreamReader reader,
+        int maxChars,
+        CancellationToken cancellationToken)
+    {
+        var result = new StringBuilder();
+        var buffer = new char[1];
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, 1), cancellationToken);
+            if (read == 0)
+                return result.Length == 0 ? null : result.ToString();
+
+            if (buffer[0] == '\n')
+                return result.ToString();
+
+            if (buffer[0] != '\r')
+                result.Append(buffer[0]);
+
+            if (result.Length > maxChars)
+                throw new InvalidDataException("Incoming packet exceeds the maximum allowed size.");
+        }
     }
 
     public void Dispose() => Stop();

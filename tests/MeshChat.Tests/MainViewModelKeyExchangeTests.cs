@@ -120,6 +120,67 @@ public sealed class MainViewModelKeyExchangeTests
         Assert.DoesNotContain(harness.Wifi.Sends, send => send.Packet.Type == PacketType.KeyExchangeResponse);
     }
 
+    [Fact]
+    public async Task InboundKeyExchangeInit_IdentityChangeForKnownPeer_IsRejectedBeforeTrustMutation()
+    {
+        using var harness = new KeyExchangeHarness();
+        var verifiedPeer = CreateDirectPeer("bob", "Verified Bob") with
+        {
+            TrustState = TrustState.Verified,
+            SecurityStatus = "Verified",
+            FingerprintShort = "trusted"
+        };
+        harness.ViewModel.Peers.Add(verifiedPeer);
+        AddPeerById(harness.ViewModel, verifiedPeer);
+        harness.ViewModel.SelectedPeer = verifiedPeer;
+        harness.AliceTrustStore.UpsertPeerIdentity(
+            "bob",
+            "Verified Bob",
+            harness.BobIdentity.ExportPublicKey(),
+            harness.BobIdentity.Fingerprint);
+        harness.AliceTrustStore.MarkVerified("bob");
+
+        using var attackerIdentity = LocalIdentity.Generate();
+        using var attackerManager = new SessionKeyManager(
+            "bob",
+            attackerIdentity,
+            new PeerTrustStore(Path.Combine(Path.GetTempPath(), "MeshChatKeyExchangeAttack", Guid.NewGuid().ToString("N"), "trust.json")));
+        var init = attackerManager.CreateOutboundKeyExchangeInit("alice");
+
+        await InvokeHandleKeyExchangeInitAsync(
+            harness.ViewModel,
+            CreatePacket(PacketType.KeyExchangeInit, "bob", "Evil Bob", init));
+
+        Assert.DoesNotContain(harness.Wifi.Sends, send => send.Packet.Type == PacketType.KeyExchangeResponse);
+        var stored = Assert.IsType<TrustedPeer>(harness.AliceTrustStore.GetByPeerId("bob"));
+        Assert.Equal(TrustState.Verified, stored.TrustState);
+        Assert.Equal("Verified Bob", stored.DisplayName);
+        Assert.Equal(harness.BobIdentity.ExportPublicKey(), stored.IdentityPublicKey);
+        Assert.Equal(harness.BobIdentity.Fingerprint, stored.Fingerprint);
+        Assert.Null(harness.AliceManager.GetActiveSession("bob"));
+        var visiblePeer = Assert.Single(harness.ViewModel.Peers, peer => peer.Id == "bob");
+        Assert.Equal("Verified Bob", visiblePeer.DisplayName);
+        Assert.Equal(TrustState.Verified, visiblePeer.TrustState);
+        Assert.Equal("Verified", visiblePeer.SecurityStatus);
+        Assert.Equal("trusted", visiblePeer.FingerprintShort);
+    }
+
+    [Fact]
+    public async Task InboundKeyExchangeInit_InvalidSignatureForUnknownPeer_DoesNotCreateTrustRecord()
+    {
+        using var harness = new KeyExchangeHarness();
+        var init = harness.BobManager.CreateOutboundKeyExchangeInit("alice");
+        init.Signature[0] ^= 0x01;
+
+        await InvokeHandleKeyExchangeInitAsync(
+            harness.ViewModel,
+            CreatePacket(PacketType.KeyExchangeInit, "bob", "Bob", init));
+
+        Assert.DoesNotContain(harness.Wifi.Sends, send => send.Packet.Type == PacketType.KeyExchangeResponse);
+        Assert.Null(harness.AliceTrustStore.GetByPeerId("bob"));
+        Assert.Null(harness.AliceManager.GetActiveSession("bob"));
+    }
+
     private static Peer CreateDirectPeer(string peerId, string displayName)
         => new()
         {
@@ -162,6 +223,16 @@ public sealed class MainViewModelKeyExchangeTests
         Assert.NotNull(method);
 
         await (Task)method.Invoke(vm, [packet, CancellationToken.None])!;
+    }
+
+    private static void AddPeerById(MainViewModel vm, Peer peer)
+    {
+        var field = typeof(MainViewModel).GetField(
+            "_peerById",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        var peers = (Dictionary<string, Peer>)field.GetValue(vm)!;
+        peers[peer.Id] = peer;
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

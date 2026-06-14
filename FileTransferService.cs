@@ -46,6 +46,16 @@ public record FileTransferStartedInfo(
     string SenderName,
     string? TargetId);
 
+public record FileTransferOfferInfo(
+    string MessageId,
+    string FileName,
+    long TotalSize,
+    int TotalChunks,
+    string SenderId,
+    string SenderName,
+    string? TargetId,
+    string? FileSha256);
+
 public interface IFileTransferService
 {
     event Action<FileTransferStartedInfo>? FileStarted;
@@ -61,16 +71,27 @@ public interface IFileTransferService
         CancellationToken cancellationToken = default,
         string? messageId = null);
 
+    bool RegisterIncomingOffer(FileTransferOfferInfo offer);
+    bool AcceptIncomingTransfer(string senderId, string messageId);
+    bool DeclineIncomingTransfer(string senderId, string messageId);
+    bool CancelIncomingTransfer(string senderId, string messageId);
+    int CleanupExpiredIncomingTransfers();
     void HandleChunk(NetworkPacket packet);
 }
 
 public class FileTransferService : IFileTransferService
 {
     private const int ChunkSize = 32 * 1024; // 32KB per chunk
+    private const int MaxEncodedChunkLength = ((ChunkSize + 2) / 3) * 4;
+    private const int MaxActiveIncomingTransfers = 32;
+    private const long MaxFileSize = 100L * 1024 * 1024;
+    private const int MaxChunkPayloadChars = MaxEncodedChunkLength + 4096;
+    private static readonly TimeSpan IncomingOfferLifetime = TimeSpan.FromMinutes(10);
     private const string ServiceName = "FileTransfer";
 
     private readonly ILogger<FileTransferService> _logger;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FileTransferInfo> _incoming = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IncomingTransferAuthorization> _incomingAuthorizations = new();
 
     public event Action<FileTransferStartedInfo>? FileStarted;
     public event Action<string, double>? ProgressUpdated;   // messageId, 0-1
@@ -146,6 +167,11 @@ public class FileTransferService : IFileTransferService
     public void HandleChunk(NetworkPacket packet)
     {
         if (packet.Payload == null) return;
+        if (packet.Payload.Length > MaxChunkPayloadChars)
+        {
+            Log("Rejected oversized file chunk payload");
+            return;
+        }
 
         FileChunkPayload? chunk;
         try
@@ -161,8 +187,12 @@ public class FileTransferService : IFileTransferService
 
         if (chunk == null) return;
         if (!IsValidChunkMetadata(chunk)) return;
+        if (!IsExpectedTotalChunks(chunk)) return;
+        if (!IsExpectedEncodedChunkLength(chunk)) return;
+        if (!TryAuthorizeChunk(packet, chunk)) return;
 
         var transfer = GetOrCreateTransfer(chunk, out var isNewTransfer);
+        if (transfer == null) return;
         if (transfer.FileName != chunk.FileName ||
             transfer.TotalSize != chunk.TotalSize ||
             transfer.TotalChunks != chunk.TotalChunks)
@@ -255,7 +285,65 @@ public class FileTransferService : IFileTransferService
             }
 
             _incoming.TryRemove(chunk.MessageId, out _);
+            MarkAuthorizationCompleted(packet.SenderId, chunk.MessageId);
         }
+    }
+
+    public bool RegisterIncomingOffer(FileTransferOfferInfo offer)
+    {
+        if (!IsValidOffer(offer))
+            return false;
+
+        CleanupExpiredIncomingTransfers();
+        if (_incomingAuthorizations.Count >= MaxActiveIncomingTransfers)
+        {
+            Log("Rejected file offer: too many active incoming transfers");
+            return false;
+        }
+
+        var authorization = new IncomingTransferAuthorization(
+            offer.MessageId,
+            offer.SenderId,
+            offer.FileName,
+            offer.TotalSize,
+            offer.TotalChunks,
+            NormalizeFileHash(offer.FileSha256),
+            IncomingTransferAuthorizationState.Offered,
+            DateTime.UtcNow.Add(IncomingOfferLifetime));
+        return _incomingAuthorizations.TryAdd(GetTransferKey(offer.SenderId, offer.MessageId), authorization);
+    }
+
+    public bool AcceptIncomingTransfer(string senderId, string messageId)
+        => UpdateIncomingAuthorization(senderId, messageId, IncomingTransferAuthorizationState.Accepted);
+
+    public bool DeclineIncomingTransfer(string senderId, string messageId)
+        => UpdateIncomingAuthorization(senderId, messageId, IncomingTransferAuthorizationState.Declined);
+
+    public bool CancelIncomingTransfer(string senderId, string messageId)
+        => UpdateIncomingAuthorization(senderId, messageId, IncomingTransferAuthorizationState.Canceled);
+
+    public int CleanupExpiredIncomingTransfers()
+    {
+        var now = DateTime.UtcNow;
+        var removed = 0;
+        foreach (var item in _incomingAuthorizations)
+        {
+            if (now < item.Value.ExpiresAt &&
+                item.Value.State is not (IncomingTransferAuthorizationState.Completed
+                    or IncomingTransferAuthorizationState.Canceled
+                    or IncomingTransferAuthorizationState.Declined))
+            {
+                continue;
+            }
+
+            if (_incomingAuthorizations.TryRemove(item.Key, out _))
+                removed++;
+
+            if (_incoming.TryRemove(item.Value.MessageId, out var transfer))
+                CleanupPartialFile(transfer.PartialPath);
+        }
+
+        return removed;
     }
 
     private void SaveFile(FileTransferInfo transfer)
@@ -305,12 +393,19 @@ public class FileTransferService : IFileTransferService
         using var _ = new FileStream(partialPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
     }
 
-    private FileTransferInfo GetOrCreateTransfer(FileChunkPayload chunk, out bool isNewTransfer)
+    private FileTransferInfo? GetOrCreateTransfer(FileChunkPayload chunk, out bool isNewTransfer)
     {
         if (_incoming.TryGetValue(chunk.MessageId, out var existing))
         {
             isNewTransfer = false;
             return existing;
+        }
+
+        if (_incoming.Count >= MaxActiveIncomingTransfers)
+        {
+            Log("Rejected file transfer: too many active incoming transfers");
+            isNewTransfer = false;
+            return null;
         }
 
         var transfer = new FileTransferInfo
@@ -332,6 +427,71 @@ public class FileTransferService : IFileTransferService
 
         isNewTransfer = false;
         return _incoming[chunk.MessageId];
+    }
+
+    private bool TryAuthorizeChunk(NetworkPacket packet, FileChunkPayload chunk)
+    {
+        CleanupExpiredIncomingTransfers();
+
+        var key = GetTransferKey(packet.SenderId, chunk.MessageId);
+        if (!_incomingAuthorizations.TryGetValue(key, out var authorization))
+        {
+            Log($"Rejected unauthorized file chunk for {chunk.MessageId}");
+            return false;
+        }
+
+        if (authorization.State != IncomingTransferAuthorizationState.Accepted)
+        {
+            Log($"Rejected file chunk for {chunk.MessageId}: transfer is not accepted");
+            return false;
+        }
+
+        if (DateTime.UtcNow >= authorization.ExpiresAt)
+        {
+            _incomingAuthorizations.TryRemove(key, out _);
+            Log($"Rejected expired file chunk for {chunk.MessageId}");
+            return false;
+        }
+
+        if (!string.Equals(authorization.FileName, chunk.FileName, StringComparison.Ordinal) ||
+            authorization.TotalSize != chunk.TotalSize ||
+            authorization.TotalChunks != chunk.TotalChunks ||
+            !string.Equals(authorization.FileSha256, NormalizeFileHash(chunk.FileSha256), StringComparison.OrdinalIgnoreCase))
+        {
+            Log($"Rejected file chunk for {chunk.MessageId}: offer metadata mismatch");
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool UpdateIncomingAuthorization(string senderId, string messageId, IncomingTransferAuthorizationState state)
+    {
+        var key = GetTransferKey(senderId, messageId);
+        if (!_incomingAuthorizations.TryGetValue(key, out var existing) ||
+            existing.State is IncomingTransferAuthorizationState.Completed
+                or IncomingTransferAuthorizationState.Canceled
+                or IncomingTransferAuthorizationState.Declined ||
+            DateTime.UtcNow >= existing.ExpiresAt)
+        {
+            return false;
+        }
+
+        _incomingAuthorizations[key] = existing with { State = state };
+        if (state is IncomingTransferAuthorizationState.Canceled or IncomingTransferAuthorizationState.Declined &&
+            _incoming.TryRemove(messageId, out var transfer))
+        {
+            CleanupPartialFile(transfer.PartialPath);
+        }
+
+        return true;
+    }
+
+    private void MarkAuthorizationCompleted(string senderId, string messageId)
+    {
+        var key = GetTransferKey(senderId, messageId);
+        if (_incomingAuthorizations.TryGetValue(key, out var existing))
+            _incomingAuthorizations[key] = existing with { State = IncomingTransferAuthorizationState.Completed };
     }
 
     private static async Task<string> ComputeFileSha256Async(string filePath, CancellationToken cancellationToken)
@@ -424,9 +584,42 @@ public class FileTransferService : IFileTransferService
     {
         return !string.IsNullOrWhiteSpace(chunk.MessageId) &&
                chunk.TotalSize >= 0 &&
+               chunk.TotalSize <= MaxFileSize &&
                chunk.TotalChunks > 0 &&
                chunk.ChunkIndex >= 0 &&
                chunk.ChunkIndex < chunk.TotalChunks;
+    }
+
+    private static bool IsValidOffer(FileTransferOfferInfo offer)
+    {
+        if (string.IsNullOrWhiteSpace(offer.SenderId))
+            return false;
+
+        var chunkMetadata = new FileChunkPayload
+        {
+            MessageId = offer.MessageId,
+            FileName = offer.FileName,
+            TotalSize = offer.TotalSize,
+            TotalChunks = offer.TotalChunks,
+            ChunkIndex = 0
+        };
+
+        return IsValidChunkMetadata(chunkMetadata) &&
+               IsExpectedTotalChunks(chunkMetadata);
+    }
+
+    private static bool IsExpectedTotalChunks(FileChunkPayload chunk)
+    {
+        var expectedTotalChunks = Math.Max(1, (int)Math.Ceiling((double)chunk.TotalSize / ChunkSize));
+        return chunk.TotalChunks == expectedTotalChunks;
+    }
+
+    private static bool IsExpectedEncodedChunkLength(FileChunkPayload chunk)
+    {
+        if (string.IsNullOrEmpty(chunk.Data))
+            return true;
+
+        return chunk.Data.Length <= MaxEncodedChunkLength;
     }
 
     private static bool IsExpectedChunkSize(FileChunkPayload chunk, int decodedBytes)
@@ -458,4 +651,26 @@ public class FileTransferService : IFileTransferService
     }
 
     private void Log(string msg) => LogMessage?.Invoke($"[{ServiceName}] {msg}");
+
+    private static string GetTransferKey(string senderId, string messageId)
+        => $"{senderId}\n{messageId}";
+
+    private sealed record IncomingTransferAuthorization(
+        string MessageId,
+        string SenderId,
+        string FileName,
+        long TotalSize,
+        int TotalChunks,
+        string? FileSha256,
+        IncomingTransferAuthorizationState State,
+        DateTime ExpiresAt);
+
+    private enum IncomingTransferAuthorizationState
+    {
+        Offered,
+        Accepted,
+        Declined,
+        Canceled,
+        Completed
+    }
 }

@@ -206,21 +206,17 @@ public sealed class DirectSessionEncryptionTests
     }
 
     [Fact]
-    public async Task DirectTextMessage_LegacyAesGcm1_StillWorksWhenEncryptionEnabledAndNoSession()
+    public async Task DirectTextMessage_EncryptionEnabledWithoutSession_DoesNotSendPlaintext()
     {
         using var harness = DirectSessionHarness.Create(establishSession: false);
         harness.AliceVm.EncryptionEnabled = true;
 
         await harness.AliceVm.SendMessageAsync();
-        var packet = Assert.Single(harness.AliceWifi.Sends, send => send.Packet.Type == PacketType.Message).Packet;
 
-        Assert.True(packet.IsEncrypted);
-        Assert.Equal("AESGCM1", packet.CryptoVersion);
-        Assert.Null(packet.CryptoSessionId);
-
-        await InvokeIncomingMessageAsync(harness.BobVm, packet);
-        var message = Assert.Single(harness.BobVm.Messages);
-        Assert.Equal("hello", message.Content);
+        Assert.DoesNotContain(harness.AliceWifi.Sends, send => send.Packet.Type == PacketType.Message);
+        var message = Assert.Single(harness.AliceVm.Messages);
+        Assert.Equal(MessageStatus.Failed, message.Status);
+        Assert.Contains("Encrypted session unavailable", harness.AliceVm.ToastMessage);
     }
 
     [Fact]
@@ -238,6 +234,104 @@ public sealed class DirectSessionEncryptionTests
         var message = JsonConvert.DeserializeObject<ChatMessage>(packet.Payload!);
         Assert.NotNull(message);
         Assert.Equal("hello", message.Content);
+    }
+
+    [Fact]
+    public void DirectFileChunk_WithConfirmedSession_EncryptsPayload()
+    {
+        using var harness = DirectSessionHarness.Create(establishSession: true);
+        var packet = new NetworkPacket
+        {
+            Type = PacketType.FileChunk,
+            SenderId = "alice",
+            SenderName = "Alice",
+            TargetId = "bob",
+            Payload = JsonConvert.SerializeObject(new FileChunkPayload
+            {
+                MessageId = "file-message",
+                FileName = "file.txt",
+                TotalSize = 9,
+                TotalChunks = 1,
+                ChunkIndex = 0,
+                Data = Convert.ToBase64String("file-body"u8.ToArray())
+            })
+        };
+
+        Assert.True(InvokeTryApplySessionPacketEncryption(harness.AliceVm, "bob", packet));
+        Assert.True(packet.IsEncrypted);
+        Assert.Equal(SessionKeyManager.CryptoVersion, packet.CryptoVersion);
+
+        var plainText = DecryptWithSessionReceiveKey(packet, harness.BobManager.GetActiveSession("alice")!);
+        var payload = JsonConvert.DeserializeObject<FileChunkPayload>(plainText);
+        Assert.NotNull(payload);
+        Assert.Equal("file-body"u8.ToArray(), Convert.FromBase64String(payload.Data!));
+    }
+
+    [Fact]
+    public void DirectFileChunk_NoConfirmedSession_DoesNotEncryptOrSendPlaintext()
+    {
+        using var harness = DirectSessionHarness.Create(establishSession: false);
+        var packet = new NetworkPacket
+        {
+            Type = PacketType.FileChunk,
+            SenderId = "alice",
+            SenderName = "Alice",
+            TargetId = "bob",
+            Payload = "{}"
+        };
+
+        Assert.False(InvokeTryApplySessionPacketEncryption(harness.AliceVm, "bob", packet));
+        Assert.False(packet.IsEncrypted);
+    }
+
+    [Fact]
+    public void IncomingFileChunk_WithoutSessionEncryption_IsRejected()
+    {
+        using var harness = DirectSessionHarness.Create(establishSession: true);
+        var packet = new NetworkPacket
+        {
+            Type = PacketType.FileChunk,
+            SenderId = "alice",
+            SenderName = "Alice",
+            TargetId = "bob",
+            Payload = JsonConvert.SerializeObject(new FileChunkPayload
+            {
+                MessageId = "plaintext-file",
+                FileName = "plain.txt",
+                TotalSize = 4,
+                TotalChunks = 1,
+                ChunkIndex = 0,
+                Data = Convert.ToBase64String("data"u8.ToArray())
+            })
+        };
+
+        Assert.False(InvokeTryPrepareIncomingFileChunkPacket(harness.BobVm, packet));
+    }
+
+    [Fact]
+    public void IncomingFileChunk_WithValidSessionButUnverifiedPeer_IsRejected()
+    {
+        using var harness = DirectSessionHarness.Create(establishSession: true);
+        var packet = CreateEncryptedFileChunkFromAlice(harness, "unverified-file");
+
+        Assert.False(InvokeTryPrepareIncomingFileChunkPacket(harness.BobVm, packet));
+    }
+
+    [Fact]
+    public void IncomingFileChunk_WithValidSessionButNoAcceptedTransfer_DoesNotAdvanceFileService()
+    {
+        using var harness = DirectSessionHarness.Create(establishSession: true);
+        harness.BobTrustStore.MarkVerified("alice");
+        var packet = CreateEncryptedFileChunkFromAlice(harness, "no-accepted-transfer");
+
+        Assert.True(InvokeTryPrepareIncomingFileChunkPacket(harness.BobVm, packet, out var preparedPacket));
+        var received = false;
+        var fileTransfer = new FileTransferService();
+        fileTransfer.FileReceived += (_, _) => received = true;
+
+        fileTransfer.HandleChunk(preparedPacket);
+
+        Assert.False(received);
     }
 
     [Fact]
@@ -281,7 +375,7 @@ public sealed class DirectSessionEncryptionTests
         => System.Text.Encoding.UTF8.GetBytes(string.Join('\n',
         [
             SessionKeyManager.CryptoVersion,
-            PacketType.Message.ToString(),
+            packet.Type.ToString(),
             packet.CryptoSessionId!,
             packet.SenderId,
             packet.TargetId ?? string.Empty,
@@ -296,6 +390,29 @@ public sealed class DirectSessionEncryptionTests
             .Where(send => send.Packet.Type == PacketType.Message)
             .Select(send => send.Packet)
             .Last();
+    }
+
+    private static NetworkPacket CreateEncryptedFileChunkFromAlice(DirectSessionHarness harness, string messageId)
+    {
+        var packet = new NetworkPacket
+        {
+            Type = PacketType.FileChunk,
+            SenderId = "alice",
+            SenderName = "Alice",
+            TargetId = "bob",
+            Payload = JsonConvert.SerializeObject(new FileChunkPayload
+            {
+                MessageId = messageId,
+                FileName = $"{messageId}.txt",
+                TotalSize = 4,
+                TotalChunks = 1,
+                ChunkIndex = 0,
+                Data = Convert.ToBase64String("data"u8.ToArray())
+            })
+        };
+
+        Assert.True(InvokeTryApplySessionPacketEncryption(harness.AliceVm, "bob", packet));
+        return packet;
     }
 
     private static async Task InvokeIncomingMessageAsync(MainViewModel vm, NetworkPacket packet)
@@ -316,6 +433,35 @@ public sealed class DirectSessionEncryptionTests
             BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(method);
         method.Invoke(vm, [peerId]);
+    }
+
+    private static bool InvokeTryPrepareIncomingFileChunkPacket(MainViewModel vm, NetworkPacket packet)
+        => InvokeTryPrepareIncomingFileChunkPacket(vm, packet, out _);
+
+    private static bool InvokeTryPrepareIncomingFileChunkPacket(
+        MainViewModel vm,
+        NetworkPacket packet,
+        out NetworkPacket preparedPacket)
+    {
+        var method = typeof(MainViewModel).GetMethod(
+            "TryPrepareIncomingFileChunkPacket",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+
+        object?[] args = [packet, null];
+        var result = (bool)method.Invoke(vm, args)!;
+        preparedPacket = (NetworkPacket)args[1]!;
+        return result;
+    }
+
+    private static bool InvokeTryApplySessionPacketEncryption(MainViewModel vm, string peerId, NetworkPacket packet)
+    {
+        var method = typeof(MainViewModel).GetMethod(
+            "TryApplySessionPacketEncryption",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+
+        return (bool)method.Invoke(vm, [peerId, packet])!;
     }
 
     private sealed class DirectSessionHarness : IDisposable
