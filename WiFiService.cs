@@ -54,6 +54,7 @@ public class WiFiService : INetworkService
     private MulticastService? _multicast;
     private ServiceDiscovery? _serviceDiscovery;
     private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
+    private readonly ConcurrentDictionary<string, byte> _pendingDiscoveryConnects = new();
     private readonly ConcurrentDictionary<string, byte> _seenPacketIds = new();
     private readonly ConcurrentQueue<string> _seenPacketOrder = new();
     private readonly ConcurrentDictionary<Task, byte> _clientTasks = new();
@@ -105,11 +106,15 @@ public class WiFiService : INetworkService
         IsRunning = false;
         _listener?.Stop();
         if (_serviceDiscovery != null)
-            _serviceDiscovery.ServiceInstanceDiscovered -= OnServiceDiscovered;
+        {
+            _serviceDiscovery.ServiceDiscovered -= OnServiceDiscovered;
+            _serviceDiscovery.ServiceInstanceDiscovered -= OnServiceInstanceDiscovered;
+        }
         _serviceDiscovery?.Dispose();
         _multicast?.Dispose();
         foreach (var conn in _connections.Values) conn.Close();
         _connections.Clear();
+        _pendingDiscoveryConnects.Clear();
         await WaitForBackgroundTasksAsync();
     }
 
@@ -127,24 +132,98 @@ public class WiFiService : INetworkService
             profile.AddProperty("id", LocalId);
             profile.AddProperty("name", LocalName);
             _serviceDiscovery.Advertise(profile);
-            _serviceDiscovery.ServiceInstanceDiscovered += OnServiceDiscovered;
+            _serviceDiscovery.ServiceDiscovered += OnServiceDiscovered;
+            _serviceDiscovery.ServiceInstanceDiscovered += OnServiceInstanceDiscovered;
             _multicast.Start();
+            _serviceDiscovery.QueryServiceInstances(ServiceType);
             _serviceDiscovery.QueryAllServices();
         }
         catch (Exception ex) when (IsExpectedShutdown(ex, cancellationToken)) { }
         catch (Exception ex) { LogWarning(ex, "mDNS warning: {Message}", ex.Message); }
     }
 
-    private void OnServiceDiscovered(object? sender, ServiceInstanceDiscoveryEventArgs e)
+    private void OnServiceDiscovered(object? sender, DomainName serviceName)
     {
         if (!IsRunning || _cts.IsCancellationRequested) return;
 
         try
         {
-            if (e.ServiceInstanceName.ToString().Contains(ServiceType))
-                _multicast?.SendQuery(e.ServiceInstanceName);
+            if (serviceName.ToString().Contains(ServiceType, StringComparison.OrdinalIgnoreCase))
+                _serviceDiscovery?.QueryServiceInstances(ServiceType);
         }
         catch (ObjectDisposedException) when (_cts.IsCancellationRequested) { }
+        catch (Exception ex) { LogWarning(ex, "mDNS service query failed: {Message}", ex.Message); }
+    }
+
+    private void OnServiceInstanceDiscovered(object? sender, ServiceInstanceDiscoveryEventArgs e)
+    {
+        if (!IsRunning || _cts.IsCancellationRequested) return;
+
+        try
+        {
+            if (!e.ServiceInstanceName.ToString().Contains(ServiceType, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            _multicast?.SendQuery(e.ServiceInstanceName);
+
+            var records = e.Message.Answers
+                .Concat(e.Message.AdditionalRecords)
+                .ToArray();
+            var srv = records
+                .OfType<SRVRecord>()
+                .FirstOrDefault(r => SameDomainName(r.Name, e.ServiceInstanceName));
+            if (srv == null)
+                return;
+
+            var peerId = records
+                .OfType<TXTRecord>()
+                .Where(r => SameDomainName(r.Name, e.ServiceInstanceName))
+                .SelectMany(r => r.Strings)
+                .Select(ReadDiscoveryPeerId)
+                .FirstOrDefault(id => !string.IsNullOrWhiteSpace(id));
+            if (peerId == LocalId || (peerId != null && _connections.ContainsKey(peerId)))
+                return;
+
+            var address = records
+                .OfType<AddressRecord>()
+                .FirstOrDefault(r => SameDomainName(r.Name, srv.Target))
+                ?.Address
+                ?? e.RemoteEndPoint.Address;
+            var connectKey = peerId ?? $"{address}:{srv.Port}";
+            if (!_pendingDiscoveryConnects.TryAdd(connectKey, 0))
+                return;
+
+            TrackClientTask(ConnectToDiscoveredPeerAsync(address, srv.Port, connectKey, _cts.Token));
+        }
+        catch (ObjectDisposedException) when (_cts.IsCancellationRequested) { }
+        catch (Exception ex) { LogWarning(ex, "mDNS discovery failed: {Message}", ex.Message); }
+    }
+
+    private async Task ConnectToDiscoveredPeerAsync(
+        IPAddress address,
+        int port,
+        string connectKey,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ConnectToPeerAsync(address.ToString(), port, cancellationToken);
+        }
+        finally
+        {
+            _pendingDiscoveryConnects.TryRemove(connectKey, out _);
+        }
+    }
+
+    private static bool SameDomainName(DomainName left, DomainName right)
+        => string.Equals(left.ToString(), right.ToString(), StringComparison.OrdinalIgnoreCase);
+
+    private static string? ReadDiscoveryPeerId(string value)
+    {
+        const string Prefix = "id=";
+        return value.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase)
+            ? value[Prefix.Length..]
+            : null;
     }
 
     private async Task AcceptConnectionsAsync(CancellationToken ct)
